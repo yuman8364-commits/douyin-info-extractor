@@ -1,0 +1,52 @@
+name: Bug 报告
+description: 报告可复现的问题；提交前请删除个人数据
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿上传真实抖音链接、Cookie、访问令牌、本机用户名路径、个人工作簿或媒体文件。
+  - type: input
+    id: version
+    attributes:
+      label: 工具版本
+      placeholder: 例如 2.0.3
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 与 Python 版本
+      placeholder: 例如 Windows 11 24H2，Python 3.11.9；发布版可写“EXE”
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 使用虚构链接或说明链接已脱敏
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为与脱敏日志
+    validations:
+      required: true
+  - type: dropdown
+    id: data_safety
+    attributes:
+      label: 旧媒体、文案和工作簿是否保持不变或已恢复
+      options:
+        - 是
+        - 否
+        - 不确定
+    validations:
+      required: true

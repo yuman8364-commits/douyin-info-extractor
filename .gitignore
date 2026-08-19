@@ -1,0 +1,28 @@
+# Python and build products
+__pycache__/
+*.py[cod]
+.build-venv/
+build/
+dist/
+
+# Personal runtime state and diagnostics
+config.json
+input_cache.txt
+data/
+*.log
+NUL
+
+# User output and recoverable working data
+*.xlsx
+*.xlsm
+爆款视频/
+文案提取/
+封面/
+.staging/
+替换备份/
+表格备份/
+顺序修复备份/
+字幕测试/
+
+# Local project handoff record is intentionally not published
+PROGRESS.md
