@@ -186,6 +186,41 @@ def format_ordered_links(links: list[str]) -> str:
     return "\n".join(lines)
 
 
+def remove_matching_entry(text: str, seq: int, raw_input: str) -> tuple[str, int]:
+    """删除与记录链接匹配的输入块并连续重排编号。
+
+    有可识别链接时只按链接匹配，避免当前输入框内容与表格顺序不同步时
+    误删同位置的其它任务；旧记录没有链接时才回退到序号位置。
+    """
+    raw_entries: list[str] = []
+    for index, block in enumerate(split_entry_blocks(text), 1):
+        if _is_placeholder_block(block):
+            continue
+        raw = _block_raw_content(block, index)
+        if raw:
+            raw_entries.append(raw)
+
+    target_urls = set(extractor.extract_urls(str(raw_input or "")))
+    kept: list[str] = []
+    removed = 0
+    for index, raw in enumerate(raw_entries, 1):
+        urls = set(extractor.extract_urls(raw))
+        matches = bool(target_urls and urls.intersection(target_urls))
+        if not target_urls:
+            matches = index == int(seq)
+        if matches:
+            removed += 1
+        else:
+            kept.append(raw)
+
+    if removed == 0:
+        return normalize_input_text(text), 0
+    if not kept:
+        return "1.", removed
+    combined = f"\n{DIVIDER}\n".join(kept)
+    return normalize_input_text(combined), removed
+
+
 def build_input_tasks(text: str) -> tuple[list[str], int]:
     """兼容旧调用：只返回原始任务文本。"""
     jobs, ignored = build_input_jobs(text)

@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-$appVersion = "2.0.3"
+$appVersion = "2.0.15"
 
 $python = $null
 $pythonCandidates = @(
@@ -58,6 +58,10 @@ New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 # Release packages must never inherit developer state or cached input.
 $configPath = Join-Path $dataDir "config.json"
 $cachePath = Join-Path $dataDir "input_cache.txt"
+$browserProfilePath = Join-Path $dataDir "browser_profile"
+if (Test-Path -LiteralPath $browserProfilePath) {
+    Remove-Item -LiteralPath $browserProfilePath -Recurse -Force
+}
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($configPath, "{}", $utf8NoBom)
 [System.IO.File]::WriteAllText($cachePath, "1.`n", $utf8NoBom)
@@ -68,7 +72,8 @@ if (-not (Test-Path -LiteralPath $configPath) -or -not (Test-Path -LiteralPath $
 $configText = Get-Content -LiteralPath $configPath -Raw
 $cacheText = Get-Content -LiteralPath $cachePath -Raw
 if ($configText -match 'https?://' -or $configText -match '(?i)[A-Z]:\\Users\\' -or
-    $cacheText -match 'https?://' -or $cacheText.Trim() -ne "1.") {
+    $cacheText -match 'https?://' -or $cacheText.Trim() -ne "1." -or
+    (Test-Path -LiteralPath $browserProfilePath)) {
     throw "Release privacy check failed: data contains a URL, user path, or non-empty cache."
 }
 

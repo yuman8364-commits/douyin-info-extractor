@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from openpyxl import Workbook, load_workbook
+from PIL import Image
 
 import exporter
 
@@ -65,6 +66,65 @@ class ExporterTests(unittest.TestCase):
                     exporter.update_records(path, records, [1])
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(list(path.parent.glob(".*.tmp.xlsx")), [])
+
+    def test_workbook_backup_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "提取记录.xlsx"
+            self._legacy_workbook(path)
+            records = exporter.read_records(path)
+            records[1]["title"] = "不保留表格备份"
+
+            exporter.update_records(path, records, [1], keep_backup=False)
+
+            self.assertFalse((path.parent / "表格备份").exists())
+            self.assertEqual(exporter.read_records(path)[1]["title"], "不保留表格备份")
+
+    def test_delete_record_removes_row_and_shifts_following_sequences(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "提取记录.xlsx"
+            records = {
+                1: {"raw_input": "https://example.com/1", "title": "第一条"},
+                2: {"raw_input": "https://example.com/2", "title": "删除我"},
+                3: {"raw_input": "https://example.com/3", "title": "原第三条"},
+            }
+            exporter.update_records(path, records, keep_backup=False)
+
+            deleted = exporter.delete_record(path, 2, keep_backup=False)
+
+            self.assertTrue(deleted)
+            rows = exporter.read_records(path)
+            self.assertEqual(sorted(rows), [1, 2])
+            self.assertEqual(rows[2]["title"], "原第三条")
+            self.assertFalse((path.parent / "表格备份").exists())
+
+    def test_delete_record_removes_cover_and_shifts_later_image_anchor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "提取记录.xlsx"
+            covers = {}
+            for seq in (1, 2, 3):
+                cover = root / f"{seq}.jpg"
+                Image.new("RGB", (20, 30), (seq * 40, 0, 0)).save(cover)
+                covers[seq] = str(cover)
+            records = {seq: {"title": f"第 {seq} 条"} for seq in (1, 2, 3)}
+            exporter.update_records(path, records, cover_map=covers, keep_backup=False)
+
+            self.assertTrue(exporter.delete_record(path, 2, keep_backup=False))
+
+            workbook = load_workbook(path)
+            sheet = workbook["提取记录"]
+            image_rows = sorted(exporter._image_row(image) for image in sheet._images)
+            self.assertEqual(image_rows, [2, 3])
+            workbook.close()
+
+    def test_delete_missing_record_keeps_workbook_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "提取记录.xlsx"
+            exporter.update_records(path, {1: {"title": "保留"}}, keep_backup=False)
+            original = path.read_bytes()
+
+            self.assertFalse(exporter.delete_record(path, 9, keep_backup=False))
+            self.assertEqual(path.read_bytes(), original)
 
 
 if __name__ == "__main__":

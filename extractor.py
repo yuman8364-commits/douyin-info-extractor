@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""抖音作品信息提取引擎（纯 HTTP，无需浏览器或插件）。
+"""抖音作品信息提取引擎（HTTP 优先，验证码时使用独立浏览器兜底）。
 
 数据来源：用移动端 User-Agent 请求 iesdouyin.com 分享页，
 解析页面中的 window._ROUTER_DATA，提取标题、标签、点赞数、评论数、
@@ -18,6 +18,7 @@ from pathlib import Path
 import threading
 import uuid
 from typing import Callable, Optional
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -70,8 +71,28 @@ class LoginRequiredError(ExtractionError):
     pass
 
 
+class TargetUnavailableError(LoginRequiredError):
+    """浏览器确认目标作品已失效或已被平台跳转替代。"""
+
+
 class WafBlockedError(ExtractionError):
     pass
+
+
+class CaptchaChallengeError(WafBlockedError):
+    """HTTP 200 实际返回抖音验证码中间页。"""
+
+
+class PageStructureError(ExtractionError):
+    """页面可访问，但没有找到与目标 ID 匹配的结构化作品数据。"""
+
+
+class BrowserVerificationError(ExtractionError):
+    """浏览器验证无法完成；调用方应暂停整批，避免继续触发风控。"""
+
+    def __init__(self, message: str, *, status: str | None = None):
+        super().__init__(message)
+        self.status = status or f"风控或验证异常（{message}）"
 
 
 class ResponseValidationError(ExtractionError):
@@ -96,6 +117,252 @@ class FetchedRecord:
         yield self.aweme_id
         yield self.item
         yield self.fields
+
+
+BrowserNotice = Callable[[str, str], None]
+
+
+class AccessContext:
+    """单个提取批次共享的 HTTP 会话与可选 Playwright 浏览器上下文。"""
+
+    def __init__(
+        self,
+        browser_profile_root: Path | None,
+        cancel_event: threading.Event | None = None,
+        notice: BrowserNotice | None = None,
+        verification_timeout: float = 300.0,
+        redirect_confirmation_delay: float = 10.0,
+    ):
+        self.session = _new_session()
+        self.browser_profile_root = (
+            Path(browser_profile_root) if browser_profile_root is not None else None
+        )
+        self.cancel_event = cancel_event
+        self.notice = notice
+        self.verification_timeout = verification_timeout
+        self.redirect_confirmation_delay = redirect_confirmation_delay
+        self._playwright = None
+        self._browser_context = None
+        self._browser_page = None
+        self._browser_channel: str | None = None
+        self._http_blocked = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.close()
+
+    def _notify(self, event: str, message: str) -> None:
+        logger.info("浏览器兜底：%s", message)
+        if self.notice is not None:
+            self.notice(event, message)
+
+    def close(self) -> None:
+        context, playwright = self._browser_context, self._playwright
+        self._browser_context = None
+        self._browser_page = None
+        self._playwright = None
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                logger.debug("关闭浏览器上下文失败", exc_info=True)
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                logger.debug("停止 Playwright 失败", exc_info=True)
+        try:
+            self.session.close()
+        except Exception:
+            logger.debug("关闭 HTTP 会话失败", exc_info=True)
+
+    def fetch_record(self, text: str) -> FetchedRecord:
+        """优先用共享 HTTP 会话抓取；结构/验证码异常时转入浏览器。"""
+        url = extract_url(text)
+        final_url = resolve_share_url(self.session, url, self.cancel_event)
+        kind, aweme_id = parse_id_kind(final_url)
+        browser_kind = "video" if kind == "video" else "note"
+        browser_url = f"https://www.douyin.com/{browser_kind}/{aweme_id}"
+        if self._http_blocked and self._browser_context is not None:
+            item = self._fetch_with_browser(browser_url, aweme_id)
+        else:
+            try:
+                self.session, item = fetch_item_with_session(
+                    self.session, aweme_id, kind, self.cancel_event
+                )
+            except (CaptchaChallengeError, PageStructureError) as exc:
+                if self.browser_profile_root is None:
+                    raise
+                self._http_blocked = True
+                reason = (
+                    "检测到验证码中间页"
+                    if isinstance(exc, CaptchaChallengeError)
+                    else "作品页结构无法解析"
+                )
+                self._notify("verification_required", f"{reason}，请在弹出的浏览器中完成验证")
+                item = self._fetch_with_browser(browser_url, aweme_id)
+
+        if _item_id(item) != aweme_id:
+            raise PageStructureError("页面返回了其他作品的数据，已拒绝保存")
+        fields = extract_fields(item, aweme_id)
+        canonical_kind = "video" if kind == "video" else "note"
+        canonical_url = f"https://www.douyin.com/{canonical_kind}/{aweme_id}"
+        return FetchedRecord(self.session, kind, aweme_id, canonical_url, item, fields)
+
+    def _start_browser(self):
+        if self._browser_context is not None:
+            return self._browser_context
+        ensure_not_cancelled(self.cancel_event)
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise BrowserVerificationError(
+                "浏览器组件不可用，请重新安装完整发布目录"
+            ) from exc
+
+        self.browser_profile_root.mkdir(parents=True, exist_ok=True)
+        playwright = sync_playwright().start()
+        errors: list[str] = []
+        for channel in ("msedge", "chrome"):
+            ensure_not_cancelled(self.cancel_event)
+            profile = self.browser_profile_root / channel
+            profile.mkdir(parents=True, exist_ok=True)
+            try:
+                context = playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(profile),
+                    channel=channel,
+                    headless=False,
+                    viewport=None,
+                    locale="zh-CN",
+                    accept_downloads=False,
+                )
+                self._playwright = playwright
+                self._browser_context = context
+                self._browser_channel = channel
+                self._browser_page = context.pages[0] if context.pages else context.new_page()
+                return context
+            except Exception as exc:
+                errors.append(f"{channel}: {exc}")
+        playwright.stop()
+        detail = "；".join(errors)
+        logger.warning("无法启动系统浏览器：%s", detail)
+        raise BrowserVerificationError(
+            "无法启动系统 Edge/Chrome，请关闭残留的工具专用浏览器后重试"
+        )
+
+    def _sync_browser_session(self, page) -> None:
+        try:
+            user_agent = page.evaluate("navigator.userAgent")
+            if user_agent:
+                self.session.headers["User-Agent"] = str(user_agent)
+            for cookie in self._browser_context.cookies():
+                kwargs = {"path": cookie.get("path") or "/"}
+                domain = cookie.get("domain")
+                if domain:
+                    kwargs["domain"] = domain
+                self.session.cookies.set(cookie["name"], cookie["value"], **kwargs)
+        except Exception as exc:
+            logger.warning("同步浏览器验证状态失败：%s", exc)
+
+    def _fetch_with_browser(self, final_url: str, aweme_id: str) -> dict:
+        """等待用户完成验证，并从浏览器网络响应中取得精确作品数据。"""
+        context = self._start_browser()
+        page = self._browser_page
+        if page is None or page.is_closed():
+            page = context.new_page()
+            self._browser_page = page
+
+        matched: dict[str, dict] = {}
+
+        def capture(response) -> None:
+            if matched:
+                return
+            content_type = (response.headers.get("content-type") or "").lower()
+            if "json" not in content_type and not any(
+                marker in response.url for marker in ("aweme/detail", "iteminfo", "post")
+            ):
+                return
+            try:
+                data = response.json()
+            except Exception:
+                return
+            item = find_item(data, aweme_id)
+            if item is not None:
+                matched["item"] = item
+
+        page.on("response", capture)
+        try:
+            page.goto(final_url, wait_until="domcontentloaded", timeout=30_000)
+            navigation_started = __import__("time").monotonic()
+            deadline = navigation_started + self.verification_timeout
+            while __import__("time").monotonic() < deadline:
+                ensure_not_cancelled(self.cancel_event)
+                if page.is_closed():
+                    raise BrowserVerificationError("未完成浏览器验证，窗口已关闭")
+                redirected_id = redirected_item_id(page.url, aweme_id)
+                redirect_observation_complete = (
+                    __import__("time").monotonic() - navigation_started
+                    >= self.redirect_confirmation_delay
+                )
+                explicit_unavailable = is_explicit_unavailable_redirect(page.url)
+                if redirect_observation_complete and (
+                    redirected_id is not None or explicit_unavailable
+                ):
+                    self._notify(
+                        "target_unavailable",
+                        "目标作品已失效，浏览器已自动跳转到其他作品",
+                    )
+                    detail = (
+                        f"并推荐作品 {redirected_id}"
+                        if redirected_id is not None
+                        else ""
+                    )
+                    raise TargetUnavailableError(
+                        f"浏览器确认目标作品 {aweme_id} 已返回 404{detail}"
+                    )
+                if matched:
+                    self._sync_browser_session(page)
+                    self._notify("verification_succeeded", "浏览器验证成功，继续处理当前批次")
+                    return matched["item"]
+                try:
+                    router_data = page.evaluate("() => window._ROUTER_DATA || null")
+                    item = find_item(router_data, aweme_id)
+                    if item is not None:
+                        self._sync_browser_session(page)
+                        self._notify("verification_succeeded", "浏览器验证成功，继续处理当前批次")
+                        return item
+                except Exception:
+                    if page.is_closed():
+                        raise BrowserVerificationError("未完成浏览器验证，窗口已关闭")
+                page.wait_for_timeout(500)
+        except TaskCancelled:
+            raise
+        except TargetUnavailableError:
+            raise
+        except BrowserVerificationError:
+            raise
+        except Exception as exc:
+            raise BrowserVerificationError(f"浏览器验证失败：{exc}") from exc
+        finally:
+            try:
+                page.remove_listener("response", capture)
+            except Exception:
+                pass
+        try:
+            page_text = f"{page.title()}\n{page.content()}".lower()
+        except Exception:
+            page_text = ""
+        if any(marker in page_text for marker in ("验证码中间页", "ttgcaptcha", "verify_data")):
+            raise BrowserVerificationError(
+                "未在 5 分钟内完成浏览器验证",
+                status="风控或验证异常（未完成浏览器验证）",
+            )
+        raise BrowserVerificationError(
+            "浏览器已打开作品页，但未取得匹配的作品数据",
+            status="获取失败（页面结构可能已变化）",
+        )
 
 
 def extract_url(text: str) -> str:
@@ -148,6 +415,29 @@ def parse_id_kind(final_url: str) -> tuple[str, str]:
     return kind, aweme_id
 
 
+def redirected_item_id(current_url: str, target_aweme_id: str) -> str | None:
+    """返回浏览器跳转后的其他作品 ID；非作品页或仍是目标作品时返回空。"""
+    parsed = urlparse(current_url or "")
+    candidates: list[str] = []
+    match = ID_KIND_RE.search(parsed.path)
+    if match:
+        candidates.append(match.group(2))
+    query = parse_qs(parsed.query)
+    for key in ("modal_id", "aweme_id", "item_id"):
+        candidates.extend(query.get(key) or [])
+    target = str(target_aweme_id)
+    return next(
+        (candidate for candidate in candidates if candidate.isdigit() and candidate != target),
+        None,
+    )
+
+
+def is_explicit_unavailable_redirect(current_url: str) -> bool:
+    """识别抖音失效作品跳往精选页时携带的明确 404 来源标记。"""
+    query = parse_qs(urlparse(current_url or "").query)
+    return "web_video_404_link" in (query.get("previous_page") or [])
+
+
 def find_router_data(html: str) -> Optional[dict]:
     """解析 HTML 中的 window._ROUTER_DATA，找不到时返回 None。"""
     match = ROUTER_RE.search(html or "")
@@ -159,19 +449,44 @@ def find_router_data(html: str) -> Optional[dict]:
         return None
 
 
+def is_captcha_page(response) -> bool:
+    """识别抖音 HTTP 200 验证码中间页，避免将其误判为作品异常。"""
+    try:
+        body = response.content.decode(
+            response.apparent_encoding or "utf-8", errors="replace"
+        )
+    except Exception:
+        body = response.text or ""
+    lowered = body.lower()
+    return (
+        "验证码中间页" in body
+        or ("ttgcaptcha" in lowered and "verify_data" in lowered)
+        or ("captchaoptions" in lowered and 'type":"verify"' in lowered)
+    )
+
+
 def _item_id(item: dict) -> str:
     return str(item.get("aweme_id") or item.get("aweme_id_str") or "").strip()
+
+
+def _looks_like_full_item(item: dict, aweme_id: str) -> bool:
+    """拒绝只含 aweme_id 的路由/埋点占位对象。"""
+    if _item_id(item) != str(aweme_id):
+        return False
+    return any(key in item for key in ("video", "images", "statistics", "author"))
 
 
 def find_item(data, aweme_id: str | None = None) -> Optional[dict]:
     """递归查找作品；提供作品 ID 时只返回完全匹配的条目。"""
     if isinstance(data, dict):
+        if aweme_id is not None and _looks_like_full_item(data, aweme_id):
+            return data
         item_list = data.get("item_list")
         if isinstance(item_list, list) and item_list:
             for item in item_list:
                 if not isinstance(item, dict):
                     continue
-                if aweme_id is None or _item_id(item) == str(aweme_id):
+                if aweme_id is None or _looks_like_full_item(item, aweme_id):
                     return item
         for value in data.values():
             found = find_item(value, aweme_id)
@@ -198,30 +513,21 @@ def fetch_item_with_session(
     kind: str,
     cancel_event: threading.Event | None = None,
 ) -> tuple[requests.Session, dict]:
-    """请求分享页并提取作品数据，带 UA 轮换、新会话重试和备用地址回退。
-
-    提示「需要登录/已删除/受限制」大多是抖音限流的误报：换全新会话并延时
-    重试通常即可恢复（用户反馈重启程序能解决，本质就是新会话 + 延时）。
-    """
-    other_kind = "note" if kind == "video" else "video"
+    """最多请求两个正确作品页；验证码立即退出，禁止重试放大。"""
     douyin_path = "video" if kind == "video" else "note"
     attempts = [
         (UA_IPHONE, f"{SHARE_BASE}/{kind}/{aweme_id}/"),
-        (UA_ANDROID, f"{SHARE_BASE}/{kind}/{aweme_id}/"),
-        (UA_IPHONE, f"https://www.douyin.com/{douyin_path}/{aweme_id}"),
-        (UA_IPHONE, f"{SHARE_BASE}/{other_kind}/{aweme_id}/"),
+        (UA_ANDROID, f"https://www.douyin.com/{douyin_path}/{aweme_id}"),
     ]
 
-    saw_router_data = False
+    last_network_error: Exception | None = None
     for index, (ua, url) in enumerate(attempts):
         ensure_not_cancelled(cancel_event)
-        if index > 0:
-            # 换全新会话再试，避免旧会话被风控关联
-            session = _new_session()
         session.headers["User-Agent"] = ua
         try:
             response = session.get(url, timeout=20)
         except requests.RequestException as exc:
+            last_network_error = exc
             logger.info(
                 "第 %d 次请求失败（%s），将重试", index + 1, exc.__class__.__name__
             )
@@ -229,34 +535,48 @@ def fetch_item_with_session(
                 interruptible_wait(1.5 + random.random(), cancel_event)
             continue
 
+        last_network_error = None
         try:
+            if is_captcha_page(response):
+                logger.warning("第 %d 次尝试命中验证码中间页，立即停止 HTTP 重试", index + 1)
+                raise CaptchaChallengeError("检测到抖音验证码中间页")
+            if response.status_code >= 500:
+                logger.info("第 %d 次尝试：HTTP %d，将有限重试", index + 1, response.status_code)
+                continue
+            if response.status_code in {403, 429}:
+                raise CaptchaChallengeError(
+                    f"作品页触发访问限制：HTTP {response.status_code}"
+                )
+            if response.status_code in {404, 410}:
+                raise LoginRequiredError(
+                    f"作品页暂不可用：HTTP {response.status_code}"
+                )
             if response.status_code >= 400:
-                logger.info("第 %d 次尝试：HTTP %d，将重试", index + 1, response.status_code)
-                data = None
-            else:
-                data = find_router_data(response.text)
+                raise WafBlockedError(f"作品页请求失败：HTTP {response.status_code}")
+            data = find_router_data(response.text)
         finally:
             response.close()
         if data is not None:
-            saw_router_data = True
             item = find_item(data, aweme_id)
             if item is not None:
                 if index > 0:
                     logger.info("第 %d 次尝试成功恢复数据", index + 1)
                 return session, item
             logger.warning(
-                "第 %d 次尝试：页面数据存在但无作品数据（多为限流误报），将重试",
+                "第 %d 次尝试：页面数据存在但无目标作品，将尝试浏览器兜底",
                 index + 1,
             )
         else:
-            logger.info("第 %d 次尝试：未解析到 _ROUTER_DATA，将重试", index + 1)
+            logger.info("第 %d 次尝试：未解析到作品数据", index + 1)
 
         if index < len(attempts) - 1:
-            interruptible_wait(2 + random.random() * 2, cancel_event)
+            interruptible_wait(1.5 + random.random(), cancel_event)
 
-    if saw_router_data:
-        raise LoginRequiredError("页面未返回目标作品，可能需要登录、已受限或页面结构已变化")
-    raise WafBlockedError("被抖音风控拦截，请稍后重试")
+    if last_network_error is not None:
+        raise WafBlockedError(
+            f"网络请求失败：{last_network_error.__class__.__name__}"
+        ) from last_network_error
+    raise PageStructureError("作品页可访问，但未返回匹配的结构化作品数据")
 
 
 def fetch_item(session: requests.Session, aweme_id: str, kind: str) -> dict:
@@ -321,18 +641,14 @@ def fetch_record(
     cancel_event: threading.Event | None = None,
 ) -> FetchedRecord:
     """解析一条输入并返回成功会话、稳定 ID、规范链接和作品字段。"""
-    url = extract_url(text)
-    session = _new_session()
-
-    final_url = resolve_share_url(session, url, cancel_event)
-    kind, aweme_id = parse_id_kind(final_url)
-    session, item = fetch_item_with_session(session, aweme_id, kind, cancel_event)
-    if _item_id(item) and _item_id(item) != aweme_id:
-        raise ExtractionError("页面返回了其他作品的数据，已拒绝保存")
-    fields = extract_fields(item, aweme_id)
-    canonical_kind = "video" if kind == "video" else "note"
-    canonical_url = f"https://www.douyin.com/{canonical_kind}/{aweme_id}"
-    return FetchedRecord(session, kind, aweme_id, canonical_url, item, fields)
+    context = AccessContext(None, cancel_event)
+    try:
+        record = context.fetch_record(text)
+        # 兼容旧调用：成功会话的所有权交给返回值，不能随上下文关闭。
+        context.session = _new_session()
+        return record
+    finally:
+        context.close()
 
 
 def iter_play_urls(item: dict) -> list[str]:

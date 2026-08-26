@@ -218,14 +218,15 @@ def _backup_workbook(path: Path) -> None:
         old.unlink(missing_ok=True)
 
 
-def _save_atomic(workbook, path: Path) -> None:
+def _save_atomic(workbook, path: Path, *, keep_backup: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
     try:
         workbook.save(temp)
         check = load_workbook(temp, read_only=True)
         check.close()
-        _backup_workbook(path)
+        if keep_backup:
+            _backup_workbook(path)
         os.replace(temp, path)
     except PermissionError as exc:
         raise WorkbookInUseError(
@@ -240,6 +241,8 @@ def update_records(
     records: dict[int, dict],
     seqs: list[int] | None = None,
     cover_map: dict[int, str] | None = None,
+    *,
+    keep_backup: bool = True,
 ) -> None:
     """只更新工具管理的行和列，保留其它工作表、额外列和格式。"""
     path = Path(path)
@@ -266,7 +269,52 @@ def update_records(
                 row_by_seq[seq] = row
             cover_value = covers[seq] if seq in covers else _KEEP_COVER
             _write_record(sheet, row, record, seq, layout, cover_value)
-        _save_atomic(workbook, path)
+        _save_atomic(workbook, path, keep_backup=keep_backup)
+    finally:
+        workbook.close()
+
+
+def delete_record(path, seq: int, *, keep_backup: bool = True) -> bool:
+    """原子删除指定顺序行，并把后续记录顺序前移一位。"""
+    path = Path(path)
+    if not path.exists():
+        return False
+    workbook = load_workbook(path)
+    try:
+        sheet = _select_sheet(workbook, create=False)
+        if sheet is None:
+            return False
+        layout = {name: index + 1 for index, name in enumerate(_headers(sheet)) if name}
+        seq_column = layout.get("顺序")
+        if seq_column is None:
+            return False
+        target_row: int | None = None
+        for row in range(2, sheet.max_row + 1):
+            if _parse_seq(sheet.cell(row=row, column=seq_column).value) == int(seq):
+                target_row = row
+                break
+        if target_row is None:
+            return False
+
+        shifted_images = []
+        for image in sheet._images:
+            image_row = _image_row(image)
+            if image_row == target_row:
+                continue
+            if image_row is not None and image_row > target_row:
+                image.anchor._from.row -= 1
+                if hasattr(image.anchor, "_to"):
+                    image.anchor._to.row -= 1
+            shifted_images.append(image)
+        sheet._images = shifted_images
+        sheet.delete_rows(target_row, 1)
+
+        for row in range(2, sheet.max_row + 1):
+            value = _parse_seq(sheet.cell(row=row, column=seq_column).value)
+            if value is not None and value > int(seq):
+                sheet.cell(row=row, column=seq_column, value=value - 1)
+        _save_atomic(workbook, path, keep_backup=keep_backup)
+        return True
     finally:
         workbook.close()
 

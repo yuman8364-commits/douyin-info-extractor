@@ -52,12 +52,50 @@ class InputParserTests(unittest.TestCase):
                 "https://v.douyin.com/Nine/",
             ],
         )
-
         formatted = input_parser.format_ordered_links(links)
         jobs, ignored = input_parser.build_input_jobs(formatted)
         self.assertEqual(ignored, 0)
         self.assertEqual(jobs, [(1, links[0]), (2, links[1]), (3, links[2])])
         self.assertTrue(formatted.endswith("4."))
+
+    def test_delete_matching_link_removes_block_and_renumbers(self):
+        source = input_parser.format_ordered_links(
+            [
+                "https://www.douyin.com/video/100",
+                "https://www.douyin.com/video/200",
+                "https://www.douyin.com/video/300",
+            ]
+        )
+
+        updated, removed = input_parser.remove_matching_entry(
+            source, 2, "https://www.douyin.com/video/200"
+        )
+
+        self.assertEqual(removed, 1)
+        jobs, ignored = input_parser.build_input_jobs(updated)
+        self.assertEqual(ignored, 0)
+        self.assertEqual(
+            jobs,
+            [
+                (1, "https://www.douyin.com/video/100"),
+                (2, "https://www.douyin.com/video/300"),
+            ],
+        )
+
+    def test_delete_missing_link_does_not_remove_same_position(self):
+        source = input_parser.format_ordered_links(
+            ["https://www.douyin.com/video/100", "https://www.douyin.com/video/200"]
+        )
+
+        updated, removed = input_parser.remove_matching_entry(
+            source, 1, "https://www.douyin.com/video/999"
+        )
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(
+            input_parser.build_input_jobs(updated)[0],
+            input_parser.build_input_jobs(source)[0],
+        )
 
 
 if __name__ == "__main__":

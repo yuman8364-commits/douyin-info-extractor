@@ -9,6 +9,7 @@ dist/
 config.json
 input_cache.txt
 data/
+browser_profile/
 *.log
 NUL
 

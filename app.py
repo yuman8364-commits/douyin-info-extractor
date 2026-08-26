@@ -9,6 +9,7 @@ import queue
 import random
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -21,12 +22,12 @@ import tkinter as tk
 import exporter
 import extractor
 import input_parser
-from storage import ArtifactTransaction, TransactionError
+from storage import ArtifactTransaction, RecordDeletionTransaction, TransactionError
 from tasking import TaskCancelled, TaskMessage, ensure_not_cancelled, interruptible_wait
 from openpyxl import load_workbook
 from PIL import Image, ImageTk
 
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.15"
 PREVIEW_BOX_SIZE = (190, 250)
 PREVIEW_IMAGE_SIZE = (170, 230)
 PREVIEW_BACKGROUND = (242, 242, 242, 255)
@@ -62,9 +63,11 @@ def _writable_state_dir() -> Path:
 STATE_DIR = _writable_state_dir()
 CONFIG_FILE = STATE_DIR / "config.json"
 INPUT_CACHE_FILE = STATE_DIR / "input_cache.txt"
+BROWSER_PROFILE_DIR = STATE_DIR / "browser_profile"
 STARTUP_ERROR_FILE = STATE_DIR / "启动错误.log"
 LOG_NAME = "提取日志.log"
 DIVIDER_RE = input_parser.DIVIDER_RE
+SPREADSHEET_PROCESS_NAMES = ("EXCEL.EXE", "et.exe")
 
 
 # 输入解析逻辑已拆到纯逻辑模块；保留这些公开名称以兼容旧测试和调用。
@@ -132,28 +135,112 @@ def save_config(updates: dict) -> None:
         pass
 
 
+def force_close_spreadsheet_apps(logger: logging.Logger | None = None) -> list[str]:
+    """强制关闭全部 Microsoft Excel/WPS 表格进程。"""
+    closed: list[str] = []
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for image_name in SPREADSHEET_PROCESS_NAMES:
+        try:
+            result = subprocess.run(
+                ["taskkill", "/F", "/IM", image_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                creationflags=creation_flags,
+            )
+        except OSError as exc:
+            if logger is not None:
+                logger.warning("强制关闭 %s 失败：%s", image_name, exc)
+            continue
+        if result.returncode == 0:
+            closed.append(image_name)
+    return closed
+
+
+def update_records_force_close(
+    path,
+    records: dict[int, dict],
+    seqs: list[int] | None = None,
+    cover_map: dict[int, str] | None = None,
+    *,
+    allow_force_close: bool = True,
+    keep_backup: bool = False,
+) -> None:
+    """工作簿被占用时按用户要求强制关闭 Excel/WPS 并重试一次。"""
+    try:
+        exporter.update_records(
+            path, records, seqs, cover_map, keep_backup=keep_backup
+        )
+        return
+    except exporter.WorkbookInUseError:
+        if not allow_force_close:
+            raise
+
+    logger = logging.getLogger("douyin_tool")
+    logger.warning(
+        "提取记录.xlsx 被占用，按用户设置强制关闭全部 Excel/WPS 表格进程后重试写入"
+    )
+    closed = force_close_spreadsheet_apps(logger)
+    logger.warning("已结束的表格进程：%s", "、".join(closed) if closed else "未检测到或已退出")
+    time.sleep(0.8)
+    exporter.update_records(path, records, seqs, cover_map, keep_backup=keep_backup)
+
+
+def delete_record_force_close(
+    path, seq: int, *, keep_backup: bool = False
+) -> bool:
+    """删除行遇占用时强制关闭 Excel/WPS 并重试一次。"""
+    try:
+        return exporter.delete_record(path, seq, keep_backup=keep_backup)
+    except exporter.WorkbookInUseError:
+        pass
+
+    logger = logging.getLogger("douyin_tool")
+    logger.warning(
+        "删除记录时提取记录.xlsx 被占用，强制关闭全部 Excel/WPS 后重试"
+    )
+    closed = force_close_spreadsheet_apps(logger)
+    logger.warning("已结束的表格进程：%s", "、".join(closed) if closed else "未检测到或已退出")
+    time.sleep(0.8)
+    return exporter.delete_record(path, seq, keep_backup=keep_backup)
+
+
 def fetch_with_retry(
-    logger, seq: int, link: str, cancel_event: threading.Event | None = None
+    logger,
+    seq: int,
+    link: str,
+    cancel_event: threading.Event | None = None,
+    access_context: extractor.AccessContext | None = None,
 ):
-    """统一抓取重试；返回 ``(FetchedRecord, 失败状态)``。"""
+    """统一有限重试；浏览器验证失败向上抛出以触发批次熔断。"""
     last_error = "获取失败"
     for attempt in (1, 2):
         ensure_not_cancelled(cancel_event)
         try:
+            if access_context is not None:
+                return access_context.fetch_record(link), None
             return extractor.fetch_record(link, cancel_event), None
         except TaskCancelled:
             raise
+        except extractor.BrowserVerificationError:
+            raise
         except extractor.InvalidLinkError:
             return None, "链接无效"
+        except extractor.TargetUnavailableError:
+            return None, "目标作品已失效（浏览器自动跳转到其他作品）"
         except extractor.LoginRequiredError as exc:
             last_error = f"目标作品暂不可用（{exc}）"
+        except extractor.PageStructureError as exc:
+            last_error = f"获取失败（页面结构可能已变化：{exc}）"
+        except extractor.CaptchaChallengeError as exc:
+            last_error = f"风控或验证异常（{exc}）"
         except extractor.WafBlockedError as exc:
             last_error = f"风控或网络异常（{exc}）"
         except Exception as exc:
             last_error = f"获取失败（{exc}）"
         if attempt == 1:
-            logger.warning("顺序 %d：%s，等待后整体重试", seq, last_error)
-            interruptible_wait(4 + random.random() * 4, cancel_event)
+            logger.warning("顺序 %d：%s，有限重试一次", seq, last_error)
+            interruptible_wait(2 + random.random() * 2, cancel_event)
     return None, last_error
 
 
@@ -330,9 +417,11 @@ class DouyinExtractorApp:
         self.records: dict[str, dict] = {}
         self.ok_count = 0
         self.fail_count = 0
-        self.skip_count = 0
+        self.refresh_count = 0
         self.cancel_count = 0
         self.rollback_count = 0
+        self.unchecked_count = 0
+        self.pause_message = ""
         self.failed_jobs: list[tuple[int | None, str]] = []
         self.thumb_ref = None
         self.output_dir = Path(load_config().get("output_dir") or default_output_dir())
@@ -346,8 +435,6 @@ class DouyinExtractorApp:
         self.input_text.mark_set("insert", "end-1c")
         self.input_text.see("insert")
         self.load_existing_records()
-        # 恢复旧行为：输入缓存中已有且媒体仍存在的记录，启动后直接安全刷新元数据。
-        self.root.after(800, self._auto_refresh_existing_records)
 
     def _post(self, kind: str, payload=None, extra=None) -> None:
         self.message_queue.put(TaskMessage(kind, payload, extra))
@@ -395,7 +482,9 @@ class DouyinExtractorApp:
             self.start_button,
             self.single_button,
             self.update_button,
+            self.open_records_button,
             self.output_browse_button,
+            self.backup_check,
         ):
             button.config(state=state)
         self.input_text.config(state=state)
@@ -403,6 +492,7 @@ class DouyinExtractorApp:
         self.file_menu.entryconfig("选择输出目录…", state=state)
         self.file_menu.entryconfig("从已有文档导入链接…", state=state)
         self.edit_menu.entryconfig("清空输入", state=state)
+        self.edit_menu.entryconfig("删除选中记录", state=state)
         retry_state = "normal" if enabled and self.failed_jobs else "disabled"
         self.edit_menu.entryconfig("重试失败项", state=retry_state)
         self.stop_button.config(state="disabled" if enabled else "normal")
@@ -429,6 +519,7 @@ class DouyinExtractorApp:
         self.edit_menu = tk.Menu(menu_bar, tearoff=False)
         self.edit_menu.add_command(label="清空输入", command=self.clear_input)
         self.edit_menu.add_command(label="复制选中标题", command=self.copy_title)
+        self.edit_menu.add_command(label="删除选中记录", command=self.delete_selected_record)
         self.edit_menu.add_separator()
         self.edit_menu.add_command(label="重试失败项", command=self.retry_failed, state="disabled")
         menu_bar.add_cascade(label="编辑", menu=self.edit_menu)
@@ -475,10 +566,17 @@ class DouyinExtractorApp:
             output_frame, text="选择目录…", command=self.browse_output
         )
         self.output_browse_button.pack(side="right")
+        self.backup_var = tk.BooleanVar(value=False)
+        self.backup_check = ttk.Checkbutton(
+            output_frame,
+            text="备份文件",
+            variable=self.backup_var,
+        )
+        self.backup_check.pack(side="right", padx=(4, 8))
 
         button_frame = ttk.Frame(main)
         button_frame.pack(fill="x", pady=(0, 8))
-        for column in range(3):
+        for column in range(4):
             button_frame.columnconfigure(column, weight=1, uniform="main_actions")
         self.start_button = ttk.Button(button_frame, text="全部提取", command=self.start)
         self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -487,9 +585,13 @@ class DouyinExtractorApp:
         )
         self.single_button.grid(row=0, column=1, sticky="ew", padx=4)
         self.update_button = ttk.Button(
-            button_frame, text="强制刷新记录", command=self.refresh_table_data
+            button_frame, text="刷新记录", command=self.refresh_table_data
         )
-        self.update_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.update_button.grid(row=0, column=2, sticky="ew", padx=4)
+        self.open_records_button = ttk.Button(
+            button_frame, text="打开提取记录", command=self.open_records
+        )
+        self.open_records_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         progress_frame = ttk.Frame(main)
         progress_frame.pack(fill="x", pady=(0, 8))
@@ -507,6 +609,15 @@ class DouyinExtractorApp:
 
         columns = ("title", "likes", "comments", "media", "status")
         self.tree = ttk.Treeview(result_frame, columns=columns, show="headings")
+        self.tree.tag_configure(
+            "refreshing", background="#e8f5e9", foreground="#1b5e20"
+        )
+        self.tree.tag_configure(
+            "refresh_success", background="#d7f2df", foreground="#145c2e"
+        )
+        self.tree.tag_configure(
+            "refresh_failure", background="#fde0e0", foreground="#9b1c1c"
+        )
         headings = {
             "title": ("标题", 300),
             "likes": ("点赞数", 90),
@@ -523,6 +634,10 @@ class DouyinExtractorApp:
         self.tree.configure(yscrollcommand=tree_scroll.set)
         tree_scroll.pack(side="left", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Button-3>", self._show_record_menu)
+        self.tree.bind("<Delete>", self.delete_selected_record)
+        self.record_menu = tk.Menu(self.tree, tearoff=False)
+        self.record_menu.add_command(label="删除选中记录", command=self.delete_selected_record)
 
         self.preview_frame = ttk.Frame(
             result_frame,
@@ -543,7 +658,7 @@ class DouyinExtractorApp:
 
         self.status_var = tk.StringVar(
             value="就绪：粘贴链接，选择输出目录后点击「全部提取」"
-            "（自动检测重复、校验顺序、记录日志；重复内容在后台静默更新）"
+            "（右键下方记录可同步删除链接、表格行和关联文件）"
         )
         ttk.Label(main, textvariable=self.status_var, anchor="w").pack(fill="x", pady=(8, 0))
 
@@ -576,6 +691,12 @@ class DouyinExtractorApp:
                 matches = sorted(cover_dir.glob(f"{seq}.*"))
                 if matches:
                     cover_path = str(matches[0])
+            status = rec.get("status") or ""
+            row_tag = (
+                "refresh_success"
+                if status == "正常"
+                else ("refresh_failure" if status else "")
+            )
             item_id = self.tree.insert(
                 "",
                 "end",
@@ -584,8 +705,9 @@ class DouyinExtractorApp:
                     f"{rec.get('likes') or 0:,}",
                     f"{rec.get('comments') or 0:,}",
                     media_display,
-                    rec.get("status") or "—",
+                    status or "—",
                 ),
+                tags=(row_tag,) if row_tag else (),
             )
             self.records[item_id] = {
                 "title": rec.get("title") or "",
@@ -597,6 +719,14 @@ class DouyinExtractorApp:
                 "raw_input": rec.get("raw_input") or "",
                 "status": rec.get("status") or "",
             }
+
+    def _highlight_record(self, seq: int, tag: str) -> None:
+        """按表格顺序号高亮刷新中的记录及其最终结果。"""
+        for item_id, record in self.records.items():
+            if record.get("seq") == seq:
+                self.tree.item(item_id, tags=(tag,))
+                self.tree.see(item_id)
+                return
 
     def _style_input_sequences(self) -> None:
         """把锁定序号与分割线标灰，提示这两部分不可编辑（内容可编辑）。"""
@@ -665,27 +795,6 @@ class DouyinExtractorApp:
                     seen.add(hit_seq)
                     break
         return targets
-
-    def _auto_refresh_existing_records(self) -> None:
-        """启动后直接刷新输入中已提取过的记录，不重复下载媒体。"""
-        if self.running or self.refreshing:
-            return
-        self._enforce_input_sequences()
-        output_dir = Path(self.output_var.get().strip() or default_output_dir())
-        xlsx = output_dir / "提取记录.xlsx"
-        if not xlsx.exists():
-            return
-        try:
-            rows = exporter.read_records(xlsx)
-        except Exception:
-            return
-        jobs, _ignored = build_input_jobs(self.input_text.get("1.0", "end"))
-        targets = self._existing_media_targets(jobs, output_dir, rows)
-        if not targets:
-            return
-        refresh_targets = [(seq, rows[seq]) for seq, _raw in targets if seq in rows]
-        if refresh_targets:
-            self._start_table_refresh(output_dir, refresh_targets, automatic=True)
 
     def browse_output(self) -> None:
         chosen = filedialog.askdirectory(
@@ -789,8 +898,15 @@ class DouyinExtractorApp:
         save_config({"output_dir": str(output_dir)})
         self.logger = setup_logger(output_dir / LOG_NAME)
         self.logger.info("=" * 60)
-        action_name = "重试失败项" if retry_run else ("单次提取" if single_run else "新批次")
+        action_name = "重试失败项" if retry_run else ("单次提取" if single_run else "全部提取")
         self.logger.info("开始%s：共 %d 条，输出目录 %s", action_name, len(jobs), output_dir)
+        self.backup_enabled = bool(self.backup_var.get())
+        self.logger.info(
+            "长期备份：%s（失败回滚临时文件不受此选项影响）",
+            "开启" if self.backup_enabled else "关闭",
+        )
+        if not retry_run:
+            self.logger.info("表格已有记录只强制刷新最新公开数据并原子写回 Excel，绝不下载媒体")
 
         # —— 多重检测 1：提取前检查编号一致性，能自动修的立即修，需确认的弹窗提示 ——
         audit_note = ""
@@ -848,9 +964,11 @@ class DouyinExtractorApp:
         self.close_requested = False
         self.ok_count = 0
         self.fail_count = 0
-        self.skip_count = 0
+        self.refresh_count = 0
         self.cancel_count = 0
         self.rollback_count = 0
+        self.unchecked_count = 0
+        self.pause_message = ""
         self.failed_jobs = []
 
         self._set_task_controls(False)
@@ -860,11 +978,14 @@ class DouyinExtractorApp:
             self.start_button.config(text="提取中…")
         ignore_note = f"，忽略 {ignored} 行无链接内容" if ignored else ""
         if single_run:
-            self.status_var.set(f"正在单次提取当前链接{audit_note}…")
+            self.status_var.set(f"正在单次处理；表格已有记录只强制刷新 Excel{audit_note}…")
         elif retry_run:
             self.status_var.set(f"正在重试 {len(jobs)} 条失败项{audit_note}…")
         else:
-            self.status_var.set(f"开始提取，共 {len(jobs)} 条{audit_note}{ignore_note}…")
+            self.status_var.set(
+                f"开始全部处理，共 {len(jobs)} 条；表格已有记录只强制刷新 Excel"
+                f"{audit_note}{ignore_note}…"
+            )
         self.worker = threading.Thread(
             target=self._work_safe,
             args=(jobs, output_dir),
@@ -883,6 +1004,13 @@ class DouyinExtractorApp:
         videos_dir = output_dir / "爆款视频"
         xlsx = output_dir / "提取记录.xlsx"
         current_job: tuple[int | None, str] | None = None
+        access_context = extractor.AccessContext(
+            BROWSER_PROFILE_DIR,
+            self.cancel_event,
+            lambda event, message: self._post(
+                "verification", {"event": event}, message
+            ),
+        )
 
         def has_media(seq: int) -> bool:
             return (videos_dir / f"{seq}.mp4").is_file() or (videos_dir / str(seq)).is_dir()
@@ -909,17 +1037,6 @@ class DouyinExtractorApp:
                 seq_hint = input_seq if input_seq is not None else ((max(used_seqs) + 1) if used_seqs else 1)
                 logger.info("[%d/%d] 抓取顺序候选 %d：%s", index, len(normalized_jobs), seq_hint, line[:80])
 
-                fetched, fail_status = fetch_with_retry(
-                    logger, seq_hint, line, self.cancel_event
-                )
-                if fetched is None:
-                    self._post(
-                        "error",
-                        {"input": line, "job": current_job, "seq": seq_hint},
-                        fail_status,
-                    )
-                    continue
-
                 exact_hit = next(
                     (
                         link_map[url]
@@ -928,11 +1045,67 @@ class DouyinExtractorApp:
                     ),
                     None,
                 )
+
+                pause_reason = ""
+                try:
+                    fetched, fail_status = fetch_with_retry(
+                        logger,
+                        seq_hint,
+                        line,
+                        self.cancel_event,
+                        access_context,
+                    )
+                except extractor.BrowserVerificationError as exc:
+                    fetched, fail_status = None, exc.status
+                    pause_reason = str(exc)
+                if fetched is None:
+                    # 已有记录本次抓取失败时保留标题、互动数和人工字段，但状态
+                    # 必须反映本次检查结果，不能继续冒充“正常”。
+                    if exact_hit is not None:
+                        failed_record = dict(existing_rows.get(exact_hit) or {})
+                        failed_record["status"] = fail_status
+                        failed_record["updated_at"] = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        try:
+                            update_records_force_close(
+                                xlsx,
+                                {exact_hit: failed_record},
+                                [exact_hit],
+                                keep_backup=getattr(self, "backup_enabled", False),
+                            )
+                            existing_rows[exact_hit] = failed_record
+                        except Exception as exc:
+                            logger.error("顺序 %d 失败状态写回失败：%s", exact_hit, exc)
+                            fail_status = f"{fail_status}；状态写回失败（{exc}）"
+                    self._post(
+                        "error",
+                        {"input": line, "job": current_job, "seq": exact_hit or seq_hint},
+                        fail_status,
+                    )
+                    if pause_reason:
+                        unchecked = len(normalized_jobs) - index
+                        logger.warning(
+                            "浏览器验证未完成，批次熔断：当前失败 1 条，未检查 %d 条",
+                            unchecked,
+                        )
+                        self._post(
+                            "paused",
+                            {
+                                "job": current_job,
+                                "unchecked": unchecked,
+                            },
+                            f"批次已暂停：{pause_reason}",
+                        )
+                        break
+                    continue
+
                 id_hit = id_map.get(fetched.aweme_id)
                 hit_seq = id_hit or exact_hit
 
-                # 同一作品且媒体仍在：只更新元数据，不重复下载。
-                if hit_seq is not None and has_media(hit_seq):
+                # 恢复旧版分流：只要链接或作品 ID 已在表格中，就永远只刷新
+                # Excel，不以媒体是否存在为条件，也不补下载、不替换媒体。
+                if hit_seq is not None:
                     updated = dict(existing_rows.get(hit_seq) or {})
                     updated.update(
                         {
@@ -949,7 +1122,12 @@ class DouyinExtractorApp:
                         }
                     )
                     try:
-                        exporter.update_records(xlsx, {hit_seq: updated}, [hit_seq])
+                        update_records_force_close(
+                            xlsx,
+                            {hit_seq: updated},
+                            [hit_seq],
+                            keep_backup=getattr(self, "backup_enabled", False),
+                        )
                     except Exception as exc:
                         logger.error("顺序 %d 元数据写回失败：%s", hit_seq, exc)
                         self._post(
@@ -962,8 +1140,15 @@ class DouyinExtractorApp:
                     id_map[fetched.aweme_id] = hit_seq
                     for url in extractor.extract_urls(line):
                         link_map[url] = hit_seq
-                    logger.info("作品 %s 已存在，顺序 %d 只更新元数据", fetched.aweme_id, hit_seq)
-                    self._post("skip", {"seq": hit_seq, "reason": "同作品元数据已更新"})
+                    logger.info(
+                        "作品 %s 已有表格记录，顺序 %d 已强制刷新 Excel，未进入媒体下载",
+                        fetched.aweme_id,
+                        hit_seq,
+                    )
+                    self._post(
+                        "refreshed",
+                        {"seq": hit_seq, "reason": "已有记录已强制刷新 Excel，未下载媒体"},
+                    )
                     continue
 
                 if hit_seq is not None:
@@ -973,7 +1158,11 @@ class DouyinExtractorApp:
                 else:
                     seq = (max(used_seqs) + 1) if used_seqs else 1
                 replacing = seq in existing_rows or has_media(seq)
-                transaction = ArtifactTransaction(output_dir, seq)
+                transaction = ArtifactTransaction(
+                    output_dir,
+                    seq,
+                    keep_backup=getattr(self, "backup_enabled", False),
+                )
                 try:
                     if fetched.kind == "note":
                         staged_media = transaction.note_target()
@@ -1086,7 +1275,13 @@ class DouyinExtractorApp:
                         latest_rows[seq] = record
                         cover_map = build_cover_map(output_dir, set(latest_rows))
                         cover_map[seq] = str(final_cover) if final_cover else None
-                        exporter.update_records(xlsx, latest_rows, [seq], cover_map)
+                        update_records_force_close(
+                            xlsx,
+                            latest_rows,
+                            [seq],
+                            cover_map,
+                            keep_backup=getattr(self, "backup_enabled", False),
+                        )
 
                     result = transaction.commit(
                         work_kind=fetched.kind,
@@ -1136,6 +1331,7 @@ class DouyinExtractorApp:
                 f"任务异常终止，原有文件未主动修改：{exc}",
             )
         finally:
+            access_context.close()
             self._post("done")
 
     def _poll(self) -> None:
@@ -1161,17 +1357,27 @@ class DouyinExtractorApp:
                         )
                         self.records[item_id] = payload
                     continue
-                if kind == "skip":
-                    self.skip_count += 1
+                if kind == "refreshed":
+                    self.refresh_count += 1
                     self.status_var.set(
-                        f"序号 {payload.get('seq')}：{payload.get('reason') or '已更新，不重复下载'}"
+                        f"序号 {payload.get('seq')}："
+                        f"{payload.get('reason') or '已有记录已强制刷新 Excel'}"
                     )
                     continue
+                if kind == "verification":
+                    self.status_var.set(extra or "请在弹出的浏览器中完成验证")
+                    self.progress_label.config(text="等待浏览器验证…")
+                    continue
+                if kind == "paused":
+                    self.unchecked_count = int(payload.get("unchecked") or 0)
+                    self.pause_message = extra or "批次已暂停"
+                    self.status_var.set(self.pause_message)
+                    continue
                 if kind == "dup_status":
-                    self.skip_count += payload.get("total") or 0
+                    self.refresh_count += payload.get("total") or 0
                     self.status_var.set(
-                        f"后台静默更新 {payload.get('total') or 0} 条重复数据，"
-                        "不重复显示在页面…"
+                        f"已有记录已强制刷新 Excel {payload.get('total') or 0} 条，"
+                        "未进入媒体下载…"
                     )
                     continue
                 if kind == "progress":
@@ -1229,16 +1435,20 @@ class DouyinExtractorApp:
             else ("单次提取完成" if getattr(self, "single_run", False) else "完成")
         )
         summary = (
-            f"{prefix}：成功 {self.ok_count}，同作品更新 {self.skip_count}，"
-            f"失败 {self.fail_count}，取消 {self.cancel_count}，已回滚 {self.rollback_count}"
+            f"{prefix}：新提取/替换 {self.ok_count}，强制刷新写表 {self.refresh_count}，"
+            f"失败 {self.fail_count}，未检查 {self.unchecked_count}，"
+            f"取消 {self.cancel_count}，已回滚 {self.rollback_count}"
         )
+        if self.pause_message:
+            summary = f"{summary}；{self.pause_message}"
         self.status_var.set(summary)
         logger = logging.getLogger("douyin_tool")
         logger.info(
-            "批次完成：成功 %d，同作品更新 %d，失败 %d，取消 %d，已回滚 %d",
+            "批次完成：新提取/替换 %d，强制刷新写表 %d，失败 %d，未检查 %d，取消 %d，已回滚 %d",
             self.ok_count,
-            self.skip_count,
+            self.refresh_count,
             self.fail_count,
+            self.unchecked_count,
             self.cancel_count,
             self.rollback_count,
         )
@@ -1271,6 +1481,119 @@ class DouyinExtractorApp:
         except Exception:
             self.thumb_ref = None
             self.preview.config(image="", text="封面不可用")
+
+    def _show_record_menu(self, event) -> str:
+        """右键选中光标下的记录并显示删除入口。"""
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            self.tree.selection_set(item_id)
+            self.tree.focus(item_id)
+        record = self.records.get(item_id) if item_id else None
+        can_delete = bool(
+            record
+            and record.get("seq")
+            and not self.running
+            and not self.refreshing
+        )
+        self.record_menu.entryconfig(
+            "删除选中记录", state="normal" if can_delete else "disabled"
+        )
+        try:
+            self.record_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.record_menu.grab_release()
+        return "break"
+
+    def delete_selected_record(self, _event=None) -> str:
+        """同步删除输入链接、Excel 行和该顺序关联文件，并重排后续顺序。"""
+        if self.running or self.refreshing:
+            self.status_var.set("正在提取/刷新中，不能删除记录")
+            return "break"
+        selection = self.tree.selection()
+        if not selection:
+            self.status_var.set("请先在下方选择一条已提取记录")
+            return "break"
+        item_id = selection[0]
+        record = self.records.get(item_id) or {}
+        seq = record.get("seq")
+        if not isinstance(seq, int) or seq <= 0:
+            self.status_var.set("这不是已经写入提取记录的项目，无法同步删除")
+            return "break"
+
+        keep_backup = bool(self.backup_var.get())
+        title = str(record.get("title") or "无标题")
+        backup_note = (
+            "删除内容会移入“删除备份”。"
+            if keep_backup
+            else "“备份文件”未勾选，删除内容成功后不可恢复。"
+        )
+        confirmed = messagebox.askyesno(
+            "删除提取记录",
+            f"确定删除顺序 {seq}：{title[:50]}？\n\n"
+            "将同步删除：\n"
+            "· 上方输入框中的对应链接\n"
+            "· 下方列表和提取记录.xlsx 对应行\n"
+            "· 对应视频/图集、封面和文案\n"
+            "· 后续记录及文件顺序将整体前移一位\n\n"
+            f"{backup_note}",
+            parent=self.root,
+        )
+        if not confirmed:
+            return "break"
+
+        output_dir = Path(self.output_var.get().strip() or default_output_dir())
+        xlsx = output_dir / "提取记录.xlsx"
+        logger = setup_logger(output_dir / LOG_NAME)
+        old_input = self.input_text.get("1.0", "end")
+        transaction = RecordDeletionTransaction(
+            output_dir, seq, keep_backup=keep_backup
+        )
+        try:
+            result = transaction.commit(
+                lambda: delete_record_force_close(
+                    xlsx, seq, keep_backup=keep_backup
+                )
+            )
+        except TransactionError as exc:
+            logger.error("删除顺序 %d 失败：%s", seq, exc)
+            messagebox.showerror(
+                "删除失败",
+                str(exc),
+                parent=self.root,
+            )
+            self.status_var.set(f"删除顺序 {seq} 失败，原记录已尽量恢复")
+            return "break"
+        except Exception as exc:
+            logger.exception("删除顺序 %d 异常", seq)
+            messagebox.showerror("删除失败", str(exc), parent=self.root)
+            self.status_var.set(f"删除顺序 {seq} 失败：{exc}")
+            return "break"
+
+        new_input, removed_links = input_parser.remove_matching_entry(
+            old_input, seq, str(record.get("raw_input") or "")
+        )
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", new_input)
+        self.input_text.mark_set("insert", "end-1c")
+        self.input_text.see("insert")
+        self._style_input_sequences()
+        self._save_input_cache()
+        self.thumb_ref = None
+        self.preview.config(image="", text="选中一行查看封面预览")
+        self.load_existing_records()
+        logger.info(
+            "已删除顺序 %d；输入链接 %d 条，关联文件 %d 个，后续重排文件 %d 个，长期备份 %s",
+            seq,
+            removed_links,
+            result.deleted_artifacts,
+            result.shifted_artifacts,
+            "有" if result.backup_dir else "无",
+        )
+        link_note = "" if removed_links else "（上方未找到对应链接）"
+        self.status_var.set(
+            f"已删除原顺序 {seq} 及关联记录{link_note}；后续顺序已前移"
+        )
+        return "break"
 
     def copy_title(self) -> None:
         selection = self.tree.selection()
@@ -1340,8 +1663,30 @@ class DouyinExtractorApp:
         target.mkdir(parents=True, exist_ok=True)
         os.startfile(target)
 
+    def open_records(self) -> None:
+        """打开当前输出目录中已经存在的提取记录，不创建空工作簿。"""
+        target = Path(self.output_var.get().strip() or default_output_dir()) / "提取记录.xlsx"
+        if not target.is_file():
+            self.status_var.set("输出目录里没有「提取记录.xlsx」")
+            messagebox.showinfo(
+                "没有提取记录",
+                "当前输出目录里还没有「提取记录.xlsx」。\n请先完成一次提取。",
+                parent=self.root,
+            )
+            return
+        try:
+            os.startfile(target)
+            self.status_var.set("已打开「提取记录.xlsx」")
+        except OSError as exc:
+            self.status_var.set(f"无法打开提取记录：{exc}")
+            messagebox.showerror(
+                "无法打开提取记录",
+                f"系统无法打开「提取记录.xlsx」：\n{exc}",
+                parent=self.root,
+            )
+
     def refresh_table_data(self) -> None:
-        """按表格里的全部链接直接强制抓取最新数据。"""
+        """按表格里的全部链接直接抓取并写入最新数据。"""
         if self.running or self.refreshing:
             self.status_var.set("正在提取/更新中，请等当前任务完成")
             return
@@ -1360,17 +1705,18 @@ class DouyinExtractorApp:
             self.status_var.set("表格里没有带链接的行，无法刷新")
             return
 
-        self._start_table_refresh(output_dir, targets, automatic=False)
+        self._start_table_refresh(output_dir, targets)
 
-    def _start_table_refresh(
-        self, output_dir: Path, targets: list, *, automatic: bool
-    ) -> None:
-        """启动安全的表格强制刷新；automatic 用于恢复旧版启动自动刷新。"""
+    def _start_table_refresh(self, output_dir: Path, targets: list) -> None:
+        """仅响应用户操作，启动安全的表格刷新。"""
+        if self.refresh_thread is not None and self.refresh_thread.is_alive():
+            self.status_var.set("上一次刷新仍在安全停止和清理浏览器，请稍候…")
+            return
         setup_logger(output_dir / LOG_NAME)
-        mode = "启动自动强制刷新" if automatic else "手动强制刷新"
-        logging.getLogger("douyin_tool").info("%s：共 %d 行有链接", mode, len(targets))
+        logging.getLogger("douyin_tool").info("手动刷新记录：共 %d 行有链接", len(targets))
         self.refreshing = True
-        self.auto_refresh = automatic
+        self.auto_refresh = False
+        self.backup_enabled = bool(self.backup_var.get())
         self.cancel_event.clear()
         self.close_requested = False
         self.failed_jobs = []
@@ -1378,8 +1724,7 @@ class DouyinExtractorApp:
         self.rollback_count = 0
         self._set_task_controls(False)
         self.update_button.config(text="刷新中…")
-        prefix = "启动后正在直接刷新已有记录" if automatic else "开始强制刷新记录"
-        self.status_var.set(f"{prefix}，共 {len(targets)} 行…")
+        self.status_var.set(f"开始刷新记录，共 {len(targets)} 行…")
         self.refresh_thread = threading.Thread(
             target=self._refresh_work_safe,
             args=(output_dir, targets),
@@ -1393,6 +1738,17 @@ class DouyinExtractorApp:
         logger = logging.getLogger("douyin_tool")
         updates: dict[int, dict] = {}
         failed_jobs: list[tuple[int | None, str]] = []
+        paused_message = ""
+        unchecked = 0
+        terminal_kind = "rdone"
+        terminal_payload = None
+        access_context = extractor.AccessContext(
+            BROWSER_PROFILE_DIR,
+            self.cancel_event,
+            lambda event, message: self._post(
+                "rverification", {"event": event}, message
+            ),
+        )
         try:
             for index, (seq, rec) in enumerate(targets, 1):
                 ensure_not_cancelled(self.cancel_event)
@@ -1402,14 +1758,24 @@ class DouyinExtractorApp:
                 if index > 1:
                     interruptible_wait(1 + random.random(), self.cancel_event)
                 link = rec.get("raw_input") or ""
-                fetched, fail_status = fetch_with_retry(
-                    logger, seq, link, self.cancel_event
-                )
+                try:
+                    fetched, fail_status = fetch_with_retry(
+                        logger, seq, link, self.cancel_event, access_context
+                    )
+                except extractor.BrowserVerificationError as exc:
+                    fetched, fail_status = None, exc.status
+                    paused_message = f"批次已暂停：{exc}"
+                    unchecked = len(targets) - index
                 updates[seq] = {
                     "record": fetched,
                     "status": "正常" if fetched is not None else fail_status,
                     "link": link,
                 }
+                self._post(
+                    "rresult",
+                    {"seq": seq, "success": fetched is not None},
+                    None if fetched is not None else fail_status,
+                )
                 if fetched is None:
                     failed_jobs.append((seq, link))
                 else:
@@ -1420,6 +1786,12 @@ class DouyinExtractorApp:
                         fetched.fields["likes"],
                         fetched.fields["comments"],
                     )
+                if paused_message:
+                    logger.warning(
+                        "浏览器验证未完成，刷新熔断：当前失败 1 条，未检查 %d 条",
+                        unchecked,
+                    )
+                    break
 
             rows = exporter.read_records(output_dir / "提取记录.xlsx")
             changed_seqs: list[int] = []
@@ -1443,67 +1815,94 @@ class DouyinExtractorApp:
                     )
                     rows[seq] = rec
                     changed_seqs.append(seq)
-                elif rec.get("likes") or rec.get("title") or rec.get("status") == "正常":
+                else:
                     logger.warning(
-                        "顺序 %d 更新失败（%s），保留原有正常数据",
+                        "顺序 %d 更新失败（%s），保留旧数据并更新状态",
                         seq,
                         update["status"],
                     )
-                else:
                     rec["status"] = update["status"]
+                    rec["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     rows[seq] = rec
                     changed_seqs.append(seq)
             if changed_seqs:
-                exporter.update_records(
-                    output_dir / "提取记录.xlsx", rows, changed_seqs
+                update_records_force_close(
+                    output_dir / "提取记录.xlsx",
+                    rows,
+                    changed_seqs,
+                    allow_force_close=not self.auto_refresh,
+                    keep_backup=getattr(self, "backup_enabled", False),
                 )
             ok_count = sum(1 for update in updates.values() if update["record"] is not None)
-            self._post(
-                "rdone",
-                {
-                    "ok": ok_count,
-                    "fail": len(updates) - ok_count,
-                    "total": len(updates),
-                    "failed_jobs": failed_jobs,
-                },
-            )
+            terminal_payload = {
+                "ok": ok_count,
+                "fail": len(updates) - ok_count,
+                "total": len(updates),
+                "failed_jobs": failed_jobs,
+                "unchecked": unchecked,
+                "message": paused_message,
+            }
         except TaskCancelled:
-            logger.info("强制刷新已按用户请求取消")
-            self._post(
-                "rcancelled",
-                {"processed": len(updates), "total": len(targets), "failed_jobs": failed_jobs},
-            )
+            logger.info("刷新记录已按用户请求取消")
+            terminal_kind = "rcancelled"
+            terminal_payload = {
+                "processed": len(updates),
+                "total": len(targets),
+                "failed_jobs": failed_jobs,
+            }
         except Exception as exc:
-            logger.exception("强制刷新异常终止")
-            self._post("rerror", str(exc))
+            logger.exception("刷新记录异常终止")
+            terminal_kind = "rerror"
+            terminal_payload = str(exc)
+        finally:
+            # 终态消息必须晚于浏览器/Playwright 清理。否则主线程会提前解锁
+            # “刷新记录”，第二个任务可能与仍在退出的持久化浏览器争用资料目录。
+            access_context.close()
+            self._post(terminal_kind, terminal_payload)
 
     def _poll_refresh(self) -> None:
         try:
             while True:
-                kind, payload, _extra = self.message_queue.get_nowait()
+                kind, payload, extra = self.message_queue.get_nowait()
                 if kind == "rprogress":
                     self.progress["value"] = int(payload["i"] / max(1, payload["n"]) * 100)
                     self.progress_label.config(
                         text=f"刷新 {payload['i']}/{payload['n']}（顺序 {payload['seq']}）"
                     )
+                    self._highlight_record(payload["seq"], "refreshing")
+                elif kind == "rresult":
+                    tag = "refresh_success" if payload["success"] else "refresh_failure"
+                    self._highlight_record(payload["seq"], tag)
+                    if not payload["success"]:
+                        self.status_var.set(
+                            f"顺序 {payload['seq']} 更新失败：{extra or '获取失败'}"
+                        )
+                elif kind == "rverification":
+                    self.status_var.set(extra or "请在弹出的浏览器中完成验证")
+                    self.progress_label.config(text="等待浏览器验证…")
                 elif kind == "rdone":
-                    was_automatic = self.auto_refresh
                     self.refreshing = False
                     self.auto_refresh = False
                     self.failed_jobs = list(payload.get("failed_jobs") or [])
                     self._set_task_controls(True)
-                    self.update_button.config(text="强制刷新记录")
+                    self.update_button.config(text="刷新记录")
                     self.progress["value"] = 0
                     self.progress_label.config(text="")
                     self.load_existing_records()
                     self.status_var.set(
                         payload.get("message")
                         or (
-                            ("启动自动刷新完成" if was_automatic else "强制刷新完成")
+                            "刷新完成"
                             + f"：共 {payload['total']} 行"
                             f"（正常 {payload['ok']}，异常 {payload['fail']}）"
                         )
                     )
+                    if payload.get("message"):
+                        self.status_var.set(
+                            f"{payload['message']}；已检查 {payload['total']}，"
+                            f"正常 {payload['ok']}，异常 {payload['fail']}，"
+                            f"未检查 {payload.get('unchecked', 0)}"
+                        )
                     if self.close_requested:
                         self.root.after(50, self._wait_then_close)
                     return
@@ -1512,7 +1911,7 @@ class DouyinExtractorApp:
                     self.auto_refresh = False
                     self.failed_jobs = list(payload.get("failed_jobs") or [])
                     self._set_task_controls(True)
-                    self.update_button.config(text="强制刷新记录")
+                    self.update_button.config(text="刷新记录")
                     self.progress["value"] = 0
                     self.progress_label.config(text="")
                     self.status_var.set(
@@ -1525,10 +1924,10 @@ class DouyinExtractorApp:
                     self.refreshing = False
                     self.auto_refresh = False
                     self._set_task_controls(True)
-                    self.update_button.config(text="强制刷新记录")
+                    self.update_button.config(text="刷新记录")
                     self.progress["value"] = 0
                     self.progress_label.config(text="")
-                    self.status_var.set(f"强制刷新失败：{payload}")
+                    self.status_var.set(f"刷新失败：{payload}")
                     if self.close_requested:
                         self.root.after(50, self._wait_then_close)
                     return
