@@ -27,7 +27,7 @@ from tasking import TaskCancelled, TaskMessage, ensure_not_cancelled, interrupti
 from openpyxl import load_workbook
 from PIL import Image, ImageTk
 
-APP_VERSION = "2.0.15"
+APP_VERSION = "2.0.17"
 PREVIEW_BOX_SIZE = (190, 250)
 PREVIEW_IMAGE_SIZE = (170, 230)
 PREVIEW_BACKGROUND = (242, 242, 242, 255)
@@ -483,6 +483,7 @@ class DouyinExtractorApp:
             self.single_button,
             self.update_button,
             self.open_records_button,
+            self.delete_record_button,
             self.output_browse_button,
             self.backup_check,
         ):
@@ -576,7 +577,7 @@ class DouyinExtractorApp:
 
         button_frame = ttk.Frame(main)
         button_frame.pack(fill="x", pady=(0, 8))
-        for column in range(4):
+        for column in range(5):
             button_frame.columnconfigure(column, weight=1, uniform="main_actions")
         self.start_button = ttk.Button(button_frame, text="全部提取", command=self.start)
         self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -591,7 +592,11 @@ class DouyinExtractorApp:
         self.open_records_button = ttk.Button(
             button_frame, text="打开提取记录", command=self.open_records
         )
-        self.open_records_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        self.open_records_button.grid(row=0, column=3, sticky="ew", padx=4)
+        self.delete_record_button = ttk.Button(
+            button_frame, text="删除选中记录", command=self.delete_selected_record
+        )
+        self.delete_record_button.grid(row=0, column=4, sticky="ew", padx=(4, 0))
 
         progress_frame = ttk.Frame(main)
         progress_frame.pack(fill="x", pady=(0, 8))
@@ -692,11 +697,9 @@ class DouyinExtractorApp:
                 if matches:
                     cover_path = str(matches[0])
             status = rec.get("status") or ""
-            row_tag = (
-                "refresh_success"
-                if status == "正常"
-                else ("refresh_failure" if status else "")
-            )
+            # 绿色只表示本轮刷新刚刚成功；任务结束重新加载后，正常/已恢复
+            # 都回到无色，只有异常状态常驻红色。
+            row_tag = "" if status in {"", "正常", "已恢复"} else "refresh_failure"
             item_id = self.tree.insert(
                 "",
                 "end",
@@ -727,6 +730,33 @@ class DouyinExtractorApp:
                 self.tree.item(item_id, tags=(tag,))
                 self.tree.see(item_id)
                 return
+
+    def _update_visible_record(self, seq: int, record: dict, tag: str) -> None:
+        """实时更新已检查行的最新数据、状态和结果颜色。"""
+        for item_id, visible in self.records.items():
+            if visible.get("seq") != seq:
+                continue
+            visible.update(
+                {
+                    "title": record.get("title") or "",
+                    "likes": record.get("likes") or 0,
+                    "comments": record.get("comments") or 0,
+                    "status": record.get("status") or "",
+                }
+            )
+            self.tree.item(
+                item_id,
+                values=(
+                    visible["title"] or "无",
+                    f"{visible['likes']:,}",
+                    f"{visible['comments']:,}",
+                    visible.get("media_display") or "未下载",
+                    visible["status"] or "—",
+                ),
+                tags=(tag,),
+            )
+            self.tree.see(item_id)
+            return
 
     def _style_input_sequences(self) -> None:
         """把锁定序号与分割线标灰，提示这两部分不可编辑（内容可编辑）。"""
@@ -1766,14 +1796,50 @@ class DouyinExtractorApp:
                     fetched, fail_status = None, exc.status
                     paused_message = f"批次已暂停：{exc}"
                     unchecked = len(targets) - index
+                previous_status = (rec.get("status") or "").strip()
+                success_status = "已恢复" if "失效" in previous_status else "正常"
                 updates[seq] = {
                     "record": fetched,
-                    "status": "正常" if fetched is not None else fail_status,
+                    "status": success_status if fetched is not None else fail_status,
                     "link": link,
                 }
+                # 每检查完一条就立即写回，避免整批结束前 Excel 仍显示旧数据。
+                rows = exporter.read_records(output_dir / "提取记录.xlsx")
+                current = dict(rows.get(seq) or rec)
+                if fetched is not None:
+                    current.update(
+                        {
+                            "raw_input": link,
+                            "title": fetched.fields["title"],
+                            "tags": fetched.fields["tags"],
+                            "likes": fetched.fields["likes"],
+                            "comments": fetched.fields["comments"],
+                            "author": fetched.fields["author"],
+                            "status": success_status,
+                            "aweme_id": fetched.aweme_id,
+                            "work_kind": "图文" if fetched.kind == "note" else "视频",
+                            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
+                else:
+                    logger.warning(
+                        "顺序 %d 更新失败（%s），保留旧数据并更新状态",
+                        seq,
+                        fail_status,
+                    )
+                    current["status"] = fail_status
+                    current["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rows[seq] = current
+                update_records_force_close(
+                    output_dir / "提取记录.xlsx",
+                    rows,
+                    [seq],
+                    allow_force_close=not self.auto_refresh,
+                    keep_backup=getattr(self, "backup_enabled", False),
+                )
                 self._post(
                     "rresult",
-                    {"seq": seq, "success": fetched is not None},
+                    {"seq": seq, "success": fetched is not None, "record": current},
                     None if fetched is not None else fail_status,
                 )
                 if fetched is None:
@@ -1793,46 +1859,6 @@ class DouyinExtractorApp:
                     )
                     break
 
-            rows = exporter.read_records(output_dir / "提取记录.xlsx")
-            changed_seqs: list[int] = []
-            for seq, update in updates.items():
-                rec = dict(rows.get(seq) or {})
-                fetched = update["record"]
-                if fetched is not None:
-                    rec.update(
-                        {
-                            "raw_input": update["link"],
-                            "title": fetched.fields["title"],
-                            "tags": fetched.fields["tags"],
-                            "likes": fetched.fields["likes"],
-                            "comments": fetched.fields["comments"],
-                            "author": fetched.fields["author"],
-                            "status": "正常",
-                            "aweme_id": fetched.aweme_id,
-                            "work_kind": "图文" if fetched.kind == "note" else "视频",
-                            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                    )
-                    rows[seq] = rec
-                    changed_seqs.append(seq)
-                else:
-                    logger.warning(
-                        "顺序 %d 更新失败（%s），保留旧数据并更新状态",
-                        seq,
-                        update["status"],
-                    )
-                    rec["status"] = update["status"]
-                    rec["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    rows[seq] = rec
-                    changed_seqs.append(seq)
-            if changed_seqs:
-                update_records_force_close(
-                    output_dir / "提取记录.xlsx",
-                    rows,
-                    changed_seqs,
-                    allow_force_close=not self.auto_refresh,
-                    keep_backup=getattr(self, "backup_enabled", False),
-                )
             ok_count = sum(1 for update in updates.values() if update["record"] is not None)
             terminal_payload = {
                 "ok": ok_count,
@@ -1872,7 +1898,7 @@ class DouyinExtractorApp:
                     self._highlight_record(payload["seq"], "refreshing")
                 elif kind == "rresult":
                     tag = "refresh_success" if payload["success"] else "refresh_failure"
-                    self._highlight_record(payload["seq"], tag)
+                    self._update_visible_record(payload["seq"], payload["record"], tag)
                     if not payload["success"]:
                         self.status_var.set(
                             f"顺序 {payload['seq']} 更新失败：{extra or '获取失败'}"

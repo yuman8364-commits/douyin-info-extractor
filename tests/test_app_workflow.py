@@ -261,6 +261,61 @@ class AppWorkflowTests(unittest.TestCase):
             self.assertEqual(rows[3]["likes"], 66)
             self.assertTrue(rows[3]["updated_at"])
 
+    def test_refresh_success_marks_previously_unavailable_link_as_recovered(self):
+        instance = self._app()
+        instance.auto_refresh = False
+        instance.backup_enabled = False
+        existing_url = "https://v.douyin.com/Recovered/"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            original = {
+                "raw_input": existing_url,
+                "title": "旧标题",
+                "likes": 1,
+                "status": "目标作品已失效（浏览器自动跳转到其他作品）",
+            }
+            exporter.update_records(root / "提取记录.xlsx", {3: original})
+
+            with mock.patch.object(
+                app, "fetch_with_retry", return_value=(fetched("789", "恢复后的标题"), None)
+            ):
+                instance._refresh_work_safe(root, [(3, original)])
+
+            rows = exporter.read_records(root / "提取记录.xlsx")
+            self.assertEqual(rows[3]["status"], "已恢复")
+            self.assertEqual(rows[3]["title"], "恢复后的标题")
+            self.assertEqual(rows[3]["likes"], 10)
+
+    def test_refresh_writes_each_checked_record_before_fetching_next(self):
+        instance = self._app()
+        instance.auto_refresh = False
+        instance.backup_enabled = False
+        first_url = "https://v.douyin.com/First/"
+        second_url = "https://v.douyin.com/Second/"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            records = {
+                1: {"raw_input": first_url, "title": "第一条", "status": "正常"},
+                2: {"raw_input": second_url, "title": "第二条", "status": "正常"},
+            }
+            exporter.update_records(root / "提取记录.xlsx", records)
+
+            def fetch_in_order(_logger, seq, *_args, **_kwargs):
+                if seq == 2:
+                    current = exporter.read_records(root / "提取记录.xlsx")
+                    self.assertEqual(current[1]["title"], "第1条新数据")
+                return fetched(str(seq), f"第{seq}条新数据"), None
+
+            with mock.patch.object(app, "fetch_with_retry", side_effect=fetch_in_order), mock.patch.object(
+                app, "interruptible_wait"
+            ):
+                instance._refresh_work_safe(root, list(records.items()))
+            messages = []
+            while not instance.message_queue.empty():
+                messages.append(instance.message_queue.get_nowait())
+            self.assertNotIn("rerror", [message.kind for message in messages])
+            self.assertEqual(messages[-1].kind, "rdone")
+
     def test_pre_cancelled_job_finishes_without_writing(self):
         instance = self._app()
         instance.cancel_event.set()
@@ -334,6 +389,33 @@ class AppWorkflowTests(unittest.TestCase):
             "row-b", tags=("refresh_failure",)
         )
         instance.tree.see.assert_called_once_with("row-b")
+
+    def test_refresh_result_updates_visible_values_and_color_immediately(self):
+        instance = self._app()
+        instance.tree = mock.Mock()
+        instance.records = {
+            "row-a": {
+                "seq": 1,
+                "title": "旧标题",
+                "likes": 1,
+                "comments": 1,
+                "media_display": "1.mp4",
+                "status": "正常",
+            }
+        }
+
+        instance._update_visible_record(
+            1,
+            {"title": "新标题", "likes": 20, "comments": 3, "status": "已恢复"},
+            "refresh_success",
+        )
+
+        instance.tree.item.assert_called_once_with(
+            "row-a",
+            values=("新标题", "20", "3", "1.mp4", "已恢复"),
+            tags=("refresh_success",),
+        )
+        instance.tree.see.assert_called_once_with("row-a")
 
     def test_refresh_terminal_message_is_posted_after_access_context_closes(self):
         instance = self._app()
