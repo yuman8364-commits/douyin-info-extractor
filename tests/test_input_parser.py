@@ -106,6 +106,25 @@ class InputParserTests(unittest.TestCase):
         )
         self.assertEqual(duplicates, [("https://v.douyin.com/Abc/", 2)])
 
+    def test_removed_urls_reports_only_links_missing_from_current_input(self):
+        previous = input_parser.format_ordered_links(
+            [
+                "https://www.douyin.com/video/100",
+                "https://www.douyin.com/video/200",
+                "https://www.douyin.com/video/300",
+            ]
+        )
+        current = input_parser.format_ordered_links(
+            [
+                "https://www.douyin.com/video/100",
+                "https://www.douyin.com/video/300",
+            ]
+        )
+        self.assertEqual(
+            input_parser.removed_urls(previous, current),
+            ["https://www.douyin.com/video/200"],
+        )
+
     def test_delete_input_entry_only_shifts_following_sequences(self):
         source = input_parser.format_ordered_links(
             [

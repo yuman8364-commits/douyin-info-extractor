@@ -65,6 +65,58 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertIn("链接重复", warning.call_args.args[0])
         instance._schedule_renumber.assert_not_called()
 
+    def test_delete_current_extracted_link_delegates_to_linked_record_deletion(self):
+        instance = self._app()
+        instance.running = False
+        instance.refreshing = False
+        instance.input_text = mock.Mock()
+        instance.input_text.index.return_value = "1.5"
+        instance.input_text.get.return_value = (
+            "1. https://www.douyin.com/video/100\n------------\n2."
+        )
+        instance.status_var = mock.Mock()
+        instance.tree = mock.Mock()
+        instance.records = {
+            "row-1": {
+                "seq": 1,
+                "raw_input": "https://www.douyin.com/video/100",
+            }
+        }
+        instance.delete_selected_record = mock.Mock(return_value="break")
+
+        result = instance.delete_current_input_link()
+
+        self.assertEqual(result, "break")
+        instance.tree.selection_set.assert_called_once_with("row-1")
+        instance.delete_selected_record.assert_called_once_with()
+        instance.input_text.delete.assert_not_called()
+
+    def test_manual_removal_of_extracted_link_restores_then_delegates(self):
+        instance = self._app()
+        previous = "1. https://www.douyin.com/video/100\n------------\n2."
+        current = "1."
+        instance._input_snapshot = previous
+        instance.input_text = mock.Mock()
+        instance.input_text.get.return_value = current
+        instance.records = {
+            "row-1": {
+                "seq": 1,
+                "raw_input": "https://www.douyin.com/video/100",
+            }
+        }
+        instance.tree = mock.Mock()
+        instance.status_var = mock.Mock()
+        instance._enforce_input_sequences = mock.Mock()
+        instance._style_input_sequences = mock.Mock()
+        instance._save_input_cache = mock.Mock()
+        instance.delete_selected_record = mock.Mock(return_value="break")
+
+        instance._renumber_input()
+
+        instance.input_text.insert.assert_called_once_with("1.0", previous)
+        instance.tree.selection_set.assert_called_once_with("row-1")
+        instance.delete_selected_record.assert_called_once_with()
+
     def test_user_write_force_closes_excel_wps_and_retries(self):
         locked = exporter.WorkbookInUseError("locked")
         with mock.patch.object(

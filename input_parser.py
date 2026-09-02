@@ -209,6 +209,14 @@ def existing_duplicate_urls(text: str, pasted_text: str) -> list[tuple[str, int]
     return duplicates
 
 
+def removed_urls(previous_text: str, current_text: str) -> list[str]:
+    """返回从上一版输入中消失的链接，并保留原出现顺序。"""
+    current_urls = set(extractor.extract_urls(current_text))
+    return [
+        url for url in extractor.extract_urls(previous_text) if url not in current_urls
+    ]
+
+
 def remove_entry_at_line(text: str, line_number: int) -> tuple[str, int | None, str]:
     """删除指定行所在的输入条目，并仅将其后的序号依次前移。
 
