@@ -97,6 +97,48 @@ class InputParserTests(unittest.TestCase):
             input_parser.build_input_jobs(source)[0],
         )
 
+    def test_duplicate_paste_reports_existing_sequence(self):
+        source = input_parser.format_ordered_links(
+            ["https://www.douyin.com/video/100", "https://v.douyin.com/Abc/"]
+        )
+        duplicates = input_parser.existing_duplicate_urls(
+            source, "再次分享 https://v.douyin.com/Abc/"
+        )
+        self.assertEqual(duplicates, [("https://v.douyin.com/Abc/", 2)])
+
+    def test_delete_input_entry_only_shifts_following_sequences(self):
+        source = input_parser.format_ordered_links(
+            [
+                "https://www.douyin.com/video/100",
+                "https://www.douyin.com/video/200",
+                "https://www.douyin.com/video/300",
+                "https://www.douyin.com/video/400",
+            ]
+        )
+        updated, removed_seq, removed_raw = input_parser.remove_entry_at_line(source, 5)
+        self.assertEqual(removed_seq, 3)
+        self.assertEqual(removed_raw, "https://www.douyin.com/video/300")
+        self.assertEqual(
+            input_parser.build_input_jobs(updated)[0],
+            [
+                (1, "https://www.douyin.com/video/100"),
+                (2, "https://www.douyin.com/video/200"),
+                (3, "https://www.douyin.com/video/400"),
+            ],
+        )
+
+    def test_delete_input_entry_does_nothing_on_divider_or_placeholder(self):
+        source = input_parser.format_ordered_links(
+            ["https://www.douyin.com/video/100", "https://www.douyin.com/video/200"]
+        )
+        for line_number in (2, 5):
+            updated, removed_seq, removed_raw = input_parser.remove_entry_at_line(
+                source, line_number
+            )
+            self.assertIsNone(removed_seq)
+            self.assertEqual(removed_raw, "")
+            self.assertEqual(updated, source)
+
 
 if __name__ == "__main__":
     unittest.main()

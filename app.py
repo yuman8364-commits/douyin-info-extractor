@@ -27,7 +27,7 @@ from tasking import TaskCancelled, TaskMessage, ensure_not_cancelled, interrupti
 from openpyxl import load_workbook
 from PIL import Image, ImageTk
 
-APP_VERSION = "2.0.17"
+APP_VERSION = "2.0.19"
 PREVIEW_BOX_SIZE = (190, 250)
 PREVIEW_IMAGE_SIZE = (170, 230)
 PREVIEW_BACKGROUND = (242, 242, 242, 255)
@@ -484,6 +484,7 @@ class DouyinExtractorApp:
             self.update_button,
             self.open_records_button,
             self.delete_record_button,
+            self.delete_input_button,
             self.output_browse_button,
             self.backup_check,
         ):
@@ -493,6 +494,7 @@ class DouyinExtractorApp:
         self.file_menu.entryconfig("选择输出目录…", state=state)
         self.file_menu.entryconfig("从已有文档导入链接…", state=state)
         self.edit_menu.entryconfig("清空输入", state=state)
+        self.edit_menu.entryconfig("删除当前输入链接", state=state)
         self.edit_menu.entryconfig("删除选中记录", state=state)
         retry_state = "normal" if enabled and self.failed_jobs else "disabled"
         self.edit_menu.entryconfig("重试失败项", state=retry_state)
@@ -519,6 +521,7 @@ class DouyinExtractorApp:
 
         self.edit_menu = tk.Menu(menu_bar, tearoff=False)
         self.edit_menu.add_command(label="清空输入", command=self.clear_input)
+        self.edit_menu.add_command(label="删除当前输入链接", command=self.delete_current_input_link)
         self.edit_menu.add_command(label="复制选中标题", command=self.copy_title)
         self.edit_menu.add_command(label="删除选中记录", command=self.delete_selected_record)
         self.edit_menu.add_separator()
@@ -536,6 +539,10 @@ class DouyinExtractorApp:
             text="粘贴抖音链接（序号 1. 2. 3. … 已锁定不可修改，只修改序号后面的原始链接/分享文案；"
             "粘贴完自动弹出下一个序号）:",
         ).pack(side="left", anchor="w")
+        self.delete_input_button = ttk.Button(
+            input_header, text="删除当前链接", command=self.delete_current_input_link
+        )
+        self.delete_input_button.pack(side="right")
 
         input_frame = ttk.Frame(main)
         input_frame.pack(fill="x", pady=(4, 8))
@@ -554,8 +561,9 @@ class DouyinExtractorApp:
         self.input_text.tag_configure("divider", foreground="#b0b0b0")
         self.input_text.insert("1.0", "1. ")
         self.input_text.bind("<KeyRelease>", self._schedule_renumber)
-        self.input_text.bind("<<Paste>>", self._schedule_renumber)
+        self.input_text.bind("<<Paste>>", self._on_input_paste)
         self.input_text.bind("<<Cut>>", self._schedule_renumber)
+        self.input_text.bind("<Control-Delete>", self.delete_current_input_link)
 
         output_frame = ttk.Frame(main)
         output_frame.pack(fill="x", pady=(0, 8))
@@ -1209,6 +1217,8 @@ class DouyinExtractorApp:
                             staged_media,
                             image_progress,
                             self.cancel_event,
+                            browser_context=access_context.browser_context,
+                            browser_context_provider=access_context.ensure_browser_context,
                         )
                         hits = [
                             find_same_size_file(videos_dir, path.stat().st_size)
@@ -1229,12 +1239,17 @@ class DouyinExtractorApp:
                                 {"seq": n, "done": done, "total": total, "unit": "bytes"},
                             )
 
+                        # 浏览器流在响应头到达前没有字节可回调，先明确显示当前
+                        # 已进入媒体下载阶段，避免用户误以为提取或写入线程卡死。
+                        video_progress(0, 0)
                         extractor.download_video(
                             fetched.session,
                             fetched.item,
                             staged_media,
                             video_progress,
                             cancel_event=self.cancel_event,
+                            browser_context=access_context.browser_context,
+                            browser_context_provider=access_context.ensure_browser_context,
                         )
                         size_hit = find_same_size_file(
                             videos_dir, staged_media.stat().st_size
@@ -1256,16 +1271,24 @@ class DouyinExtractorApp:
                                 transaction.cover_dir(),
                                 str(seq),
                                 self.cancel_event,
+                                browser_context=access_context.browser_context,
+                                browser_context_provider=access_context.ensure_browser_context,
                             )
                         except TaskCancelled:
                             raise
                         except Exception:
-                            fresh_session, fresh_item = extractor.fetch_item_with_session(
-                                fetched.session,
-                                fetched.aweme_id,
-                                fetched.kind,
-                                self.cancel_event,
-                            )
+                            try:
+                                fresh_session, fresh_item = extractor.fetch_item_with_session(
+                                    fetched.session,
+                                    fetched.aweme_id,
+                                    fetched.kind,
+                                    self.cancel_event,
+                                )
+                            except extractor.NetworkRequestError:
+                                # 封面地址过期且 Requests 链路仍不可用时，
+                                # 复用当前浏览器上下文重新取得作品数据。
+                                fresh = access_context.fetch_record(line)
+                                fresh_session, fresh_item = fresh.session, fresh.item
                             fresh_fields = extractor.extract_fields(
                                 fresh_item, fetched.aweme_id
                             )
@@ -1277,6 +1300,8 @@ class DouyinExtractorApp:
                                 transaction.cover_dir(),
                                 str(seq),
                                 self.cancel_event,
+                                browser_context=access_context.browser_context,
+                                browser_context_provider=access_context.ensure_browser_context,
                             )
 
                     old_record = existing_rows.get(seq) or {}
@@ -1396,7 +1421,14 @@ class DouyinExtractorApp:
                     continue
                 if kind == "verification":
                     self.status_var.set(extra or "请在弹出的浏览器中完成验证")
-                    self.progress_label.config(text="等待浏览器验证…")
+                    event = (payload or {}).get("event") if isinstance(payload, dict) else ""
+                    self.progress_label.config(
+                        text=(
+                            "网络链路切换中…"
+                            if event in {"network_fallback", "network_retry"}
+                            else "等待浏览器验证…"
+                        )
+                    )
                     continue
                 if kind == "paused":
                     self.unchecked_count = int(payload.get("unchecked") or 0)
@@ -1905,7 +1937,14 @@ class DouyinExtractorApp:
                         )
                 elif kind == "rverification":
                     self.status_var.set(extra or "请在弹出的浏览器中完成验证")
-                    self.progress_label.config(text="等待浏览器验证…")
+                    event = (payload or {}).get("event") if isinstance(payload, dict) else ""
+                    self.progress_label.config(
+                        text=(
+                            "网络链路切换中…"
+                            if event in {"network_fallback", "network_retry"}
+                            else "等待浏览器验证…"
+                        )
+                    )
                 elif kind == "rdone":
                     self.refreshing = False
                     self.auto_refresh = False
@@ -1968,6 +2007,42 @@ class DouyinExtractorApp:
             self.root.after_cancel(self._renumber_after_id)
         self._renumber_after_id = self.root.after_idle(self._renumber_input)
 
+    def _on_input_paste(self, _event=None):
+        """粘贴前检查已存在的链接；重复时提示并阻止本次粘贴。"""
+        try:
+            pasted = self.root.clipboard_get()
+        except tk.TclError:
+            self._schedule_renumber()
+            return None
+
+        current = self.input_text.get("1.0", "end-1c")
+        try:
+            before = self.input_text.get("1.0", "sel.first")
+            after = self.input_text.get("sel.last", "end-1c")
+            current = before + after
+        except tk.TclError:
+            pass
+
+        duplicates = input_parser.existing_duplicate_urls(current, str(pasted))
+        if duplicates:
+            details = "\n".join(
+                f"· 第 {seq} 条：{url}" for url, seq in duplicates[:5]
+            )
+            if len(duplicates) > 5:
+                details += f"\n· 其他 {len(duplicates) - 5} 条重复链接"
+            self.status_var.set(
+                f"链接重复：已在第 {duplicates[0][1]} 条，本次未粘贴"
+            )
+            messagebox.showwarning(
+                "链接重复",
+                f"本次粘贴的链接已在列表中，已阻止重复添加：\n\n{details}",
+                parent=self.root,
+            )
+            return "break"
+
+        self._schedule_renumber()
+        return None
+
     def _renumber_input(self) -> None:
         """锁定序号 + 追加下一个待填编号。
 
@@ -1983,6 +2058,34 @@ class DouyinExtractorApp:
         self._style_input_sequences()
         self._save_input_cache()
         self.status_var.set("输入已清空")
+
+    def delete_current_input_link(self, _event=None) -> str:
+        """删除光标所在的上方输入链接，只将后续序号前移。"""
+        if self.running or self.refreshing:
+            self.status_var.set("正在提取/刷新中，不能删除输入链接")
+            return "break"
+        try:
+            line_number = int(self.input_text.index("insert").split(".", 1)[0])
+        except (TypeError, ValueError, tk.TclError):
+            line_number = 1
+        current = self.input_text.get("1.0", "end-1c")
+        updated, removed_seq, _removed_raw = input_parser.remove_entry_at_line(
+            current, line_number
+        )
+        if removed_seq is None:
+            self.status_var.set("请先把光标放在要删除的链接内容上")
+            return "break"
+
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", updated)
+        self.input_text.mark_set("insert", "end-1c")
+        self.input_text.see("insert")
+        self._style_input_sequences()
+        self._save_input_cache()
+        self.status_var.set(
+            f"已删除第 {removed_seq} 条输入链接，后续序号已依次前移"
+        )
+        return "break"
 
 
 def report_unhandled_error(

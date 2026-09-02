@@ -186,6 +186,74 @@ def format_ordered_links(links: list[str]) -> str:
     return "\n".join(lines)
 
 
+def existing_duplicate_urls(text: str, pasted_text: str) -> list[tuple[str, int]]:
+    """返回粘贴内已在输入列表中存在的 ``(链接, 序号)``。
+
+    只比较可确定的完整抖音链接，不联网猜测两个不同短链是否
+    指向同一作品。
+    """
+    existing: dict[str, int] = {}
+    real_seq = 0
+    for block in split_entry_blocks(text):
+        if _is_placeholder_block(block):
+            continue
+        real_seq += 1
+        raw = _block_raw_content(block, real_seq)
+        for url in extractor.extract_urls(raw):
+            existing.setdefault(url, real_seq)
+
+    duplicates: list[tuple[str, int]] = []
+    for url in extractor.extract_urls(pasted_text):
+        if url in existing:
+            duplicates.append((url, existing[url]))
+    return duplicates
+
+
+def remove_entry_at_line(text: str, line_number: int) -> tuple[str, int | None, str]:
+    """删除指定行所在的输入条目，并仅将其后的序号依次前移。
+
+    光标在末尾待填编号或分隔线上时不删除任何条目，避免误删。
+    """
+    lines = (text or "").splitlines()
+    if not lines:
+        return "1.", None, ""
+    target_line = max(0, min(int(line_number or 1) - 1, len(lines) - 1))
+    if DIVIDER_RE.match(lines[target_line].strip()):
+        return normalize_input_text(text), None, ""
+
+    spans: list[tuple[int, int, list[str]]] = []
+    start = 0
+    for index, line in enumerate(lines):
+        if not DIVIDER_RE.match(line.strip()):
+            continue
+        if start < index:
+            spans.append((start, index, lines[start:index]))
+        start = index + 1
+    if start < len(lines):
+        spans.append((start, len(lines), lines[start:]))
+
+    kept: list[str] = []
+    removed_seq: int | None = None
+    removed_raw = ""
+    real_seq = 0
+    for span_start, span_end, block in spans:
+        if not block or _is_placeholder_block(block):
+            continue
+        real_seq += 1
+        raw = _block_raw_content(block, real_seq)
+        if span_start <= target_line < span_end:
+            removed_seq = real_seq
+            removed_raw = raw
+        elif raw:
+            kept.append(raw)
+
+    if removed_seq is None:
+        return normalize_input_text(text), None, ""
+    if not kept:
+        return "1.", removed_seq, removed_raw
+    return normalize_input_text(f"\n{DIVIDER}\n".join(kept)), removed_seq, removed_raw
+
+
 def remove_matching_entry(text: str, seq: int, raw_input: str) -> tuple[str, int]:
     """删除与记录链接匹配的输入块并连续重排编号。
 

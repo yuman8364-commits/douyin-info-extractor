@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-$appVersion = "2.0.17"
+$appVersion = "2.0.19"
 
 $python = $null
 $pythonCandidates = @(

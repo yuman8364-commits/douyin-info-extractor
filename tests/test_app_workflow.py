@@ -44,6 +44,27 @@ class AppWorkflowTests(unittest.TestCase):
         instance.silent_refreshing = False
         return instance
 
+    def test_duplicate_paste_is_warned_and_blocked(self):
+        instance = self._app()
+        instance.root = mock.Mock()
+        instance.root.clipboard_get.return_value = "https://v.douyin.com/Same/"
+        instance.input_text = mock.Mock()
+        instance.input_text.get.side_effect = lambda start, end: (
+            "1. https://v.douyin.com/Same/\n------------\n2."
+            if (start, end) == ("1.0", "end-1c")
+            else (_ for _ in ()).throw(app.tk.TclError("no selection"))
+        )
+        instance.status_var = mock.Mock()
+        instance._schedule_renumber = mock.Mock()
+
+        with mock.patch.object(app.messagebox, "showwarning") as warning:
+            result = instance._on_input_paste()
+
+        self.assertEqual(result, "break")
+        warning.assert_called_once()
+        self.assertIn("链接重复", warning.call_args.args[0])
+        instance._schedule_renumber.assert_not_called()
+
     def test_user_write_force_closes_excel_wps_and_retries(self):
         locked = exporter.WorkbookInUseError("locked")
         with mock.patch.object(
