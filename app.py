@@ -435,6 +435,11 @@ class DouyinExtractorApp:
         self.input_text.mark_set("insert", "end-1c")
         self.input_text.see("insert")
         self.load_existing_records()
+        try:
+            self._last_clipboard_text = str(self.root.clipboard_get())
+        except tk.TclError:
+            self._last_clipboard_text = ""
+        self._clipboard_poll_after_id = self.root.after(500, self._poll_clipboard_links)
 
     def _post(self, kind: str, payload=None, extra=None) -> None:
         self.message_queue.put(TaskMessage(kind, payload, extra))
@@ -2025,34 +2030,9 @@ class DouyinExtractorApp:
         except tk.TclError:
             pass
 
-        duplicates = input_parser.existing_duplicate_urls(current, str(pasted))
-        known = {input_parser.link_identity(url) for url in extractor.extract_urls(current)}
-        lower_duplicates: list[tuple[str, int]] = []
-        for url in extractor.extract_urls(str(pasted)):
-            identity = input_parser.link_identity(url)
-            if identity in known:
-                continue
-            for record in getattr(self, "records", {}).values():
-                record_urls = extractor.extract_urls(str(record.get("raw_input") or ""))
-                if any(input_parser.link_identity(value) == identity for value in record_urls):
-                    lower_duplicates.append((url, int(record.get("seq") or 0)))
-                    known.add(identity)
-                    break
-        duplicates.extend(lower_duplicates)
+        duplicates = self._duplicate_urls_against_known(current, str(pasted))
         if duplicates:
-            details = "\n".join(
-                f"· 第 {seq} 条：{url}" for url, seq in duplicates[:5]
-            )
-            if len(duplicates) > 5:
-                details += f"\n· 其他 {len(duplicates) - 5} 条重复链接"
-            self.status_var.set(
-                f"链接重复：已在第 {duplicates[0][1]} 条，本次未粘贴"
-            )
-            messagebox.showwarning(
-                "链接重复",
-                f"本次粘贴的链接已在列表中，已阻止重复添加：\n\n{details}",
-                parent=self.root,
-            )
+            self._show_duplicate_link_warning(duplicates, "本次未粘贴")
             return "break"
 
         affected = self._selected_input_jobs()
@@ -2068,6 +2048,61 @@ class DouyinExtractorApp:
 
         self._schedule_renumber()
         return None
+
+    def _duplicate_urls_against_known(
+        self, current: str, candidate: str
+    ) -> list[tuple[str, int]]:
+        """同时检查输入区和提取记录中的重复链接。"""
+        duplicates = input_parser.existing_duplicate_urls(current, candidate)
+        known = {input_parser.link_identity(url) for url in extractor.extract_urls(current)}
+        lower_duplicates: list[tuple[str, int]] = []
+        for url in extractor.extract_urls(candidate):
+            identity = input_parser.link_identity(url)
+            if identity in known:
+                continue
+            for record in getattr(self, "records", {}).values():
+                record_urls = extractor.extract_urls(str(record.get("raw_input") or ""))
+                if any(input_parser.link_identity(value) == identity for value in record_urls):
+                    lower_duplicates.append((url, int(record.get("seq") or 0)))
+                    known.add(identity)
+                    break
+        duplicates.extend(lower_duplicates)
+        return duplicates
+
+    def _show_duplicate_link_warning(
+        self, duplicates: list[tuple[str, int]], action: str
+    ) -> None:
+        details = "\n".join(f"· 第 {seq} 条：{url}" for url, seq in duplicates[:5])
+        if len(duplicates) > 5:
+            details += f"\n· 其他 {len(duplicates) - 5} 条重复链接"
+        self.status_var.set(f"链接重复：已在第 {duplicates[0][1]} 条，{action}")
+        messagebox.showwarning(
+            "链接重复",
+            f"检测到链接已经存在：\n\n{details}",
+            parent=self.root,
+        )
+
+    def _poll_clipboard_links(self) -> None:
+        """应用运行时检测新复制的抖音链接，并立即提示重复。"""
+        try:
+            clipboard_text = str(self.root.clipboard_get())
+        except tk.TclError:
+            clipboard_text = ""
+        if clipboard_text != getattr(self, "_last_clipboard_text", ""):
+            self._last_clipboard_text = clipboard_text
+            if extractor.extract_urls(clipboard_text):
+                current = self.input_text.get("1.0", "end-1c")
+                duplicates = self._duplicate_urls_against_known(
+                    current, clipboard_text
+                )
+                if duplicates:
+                    self._show_duplicate_link_warning(
+                        duplicates, "刚复制的链接未加入列表"
+                    )
+        if not self.close_requested:
+            self._clipboard_poll_after_id = self.root.after(
+                500, self._poll_clipboard_links
+            )
 
     def _matching_record_for_input_job(self, seq: int, raw: str):
         """按输入出现位置定位记录；重复链接绝不回退到前面的第一条。"""

@@ -44,6 +44,7 @@ class AppWorkflowTests(unittest.TestCase):
         instance.silent_refreshing = False
         instance.running = False
         instance.refreshing = False
+        instance.close_requested = False
         instance.records = {}
         return instance
 
@@ -150,6 +151,24 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual(result, "break")
         self.assertIn("第 7 条", warning.call_args.args[1])
         instance._schedule_renumber.assert_not_called()
+
+    def test_new_clipboard_link_immediately_warns_when_duplicate(self):
+        instance = self._app()
+        instance._last_clipboard_text = "old clipboard"
+        instance.root = mock.Mock()
+        instance.root.clipboard_get.return_value = "https://www.douyin.com/video/100"
+        instance.input_text = mock.Mock()
+        instance.input_text.get.return_value = (
+            "1. https://www.douyin.com/video/100\n------------\n2."
+        )
+        instance.status_var = mock.Mock()
+
+        with mock.patch.object(app.messagebox, "showwarning") as warning:
+            instance._poll_clipboard_links()
+
+        warning.assert_called_once()
+        self.assertIn("第 1 条", warning.call_args.args[1])
+        instance.root.after.assert_called_once_with(500, instance._poll_clipboard_links)
 
     def test_user_write_force_closes_excel_wps_and_retries(self):
         locked = exporter.WorkbookInUseError("locked")
