@@ -27,7 +27,7 @@ from tasking import TaskCancelled, TaskMessage, ensure_not_cancelled, interrupti
 from openpyxl import load_workbook
 from PIL import Image, ImageTk
 
-APP_VERSION = "2.0.21"
+APP_VERSION = "2.0.22"
 PREVIEW_BOX_SIZE = (190, 250)
 PREVIEW_IMAGE_SIZE = (170, 230)
 PREVIEW_BACKGROUND = (242, 242, 242, 255)
@@ -2105,14 +2105,17 @@ class DouyinExtractorApp:
             )
 
     def _matching_record_for_input_job(self, seq: int, raw: str):
-        """按输入出现位置定位记录；重复链接绝不回退到前面的第一条。"""
+        """只按“相同序号 + 相同链接”定位已提取记录。
+
+        上方可能存在尚未提取的重复链接；此时即使下方只有一个相同
+        链接，也绝不能回退选择它，否则删除第 20 条会误删第 14 条。
+        """
         identities = {
             input_parser.link_identity(url) for url in extractor.extract_urls(raw)
         }
         if not identities:
             return None
         exact = []
-        candidates = []
         for item_id, record in self.records.items():
             record_ids = {
                 input_parser.link_identity(url)
@@ -2120,7 +2123,6 @@ class DouyinExtractorApp:
             }
             if not identities.intersection(record_ids):
                 continue
-            candidates.append((item_id, record))
             try:
                 record_seq = int(record.get("seq"))
             except (TypeError, ValueError):
@@ -2129,8 +2131,6 @@ class DouyinExtractorApp:
                 exact.append((item_id, record))
         if len(exact) == 1:
             return exact[0]
-        if len(candidates) == 1:
-            return candidates[0]
         return None
 
     def _selected_input_jobs(self) -> list[tuple[int, str]]:

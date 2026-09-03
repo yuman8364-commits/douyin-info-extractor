@@ -126,6 +126,39 @@ class AppWorkflowTests(unittest.TestCase):
         instance.tree.selection_set.assert_called_once_with("row-3")
         instance.delete_selected_record.assert_called_once_with()
 
+    def test_delete_unextracted_item_20_never_falls_back_to_record_14(self):
+        instance = self._app()
+        repeated = "https://www.douyin.com/video/100"
+        links = [f"https://www.douyin.com/video/{index}" for index in range(1, 21)]
+        links[13] = repeated
+        links[19] = repeated
+        current = app.input_parser.format_ordered_links(links)
+        instance.input_text = mock.Mock()
+        instance.input_text.index.return_value = "39.8"
+        instance.input_text.get.return_value = current
+        instance.records = {
+            "row-14": {
+                "seq": 14,
+                "raw_input": repeated,
+            }
+        }
+        instance.tree = mock.Mock()
+        instance.status_var = mock.Mock()
+        instance._style_input_sequences = mock.Mock()
+        instance._save_input_cache = mock.Mock()
+        instance.delete_selected_record = mock.Mock(return_value="break")
+
+        result = instance.delete_current_input_link()
+
+        self.assertEqual(result, "break")
+        instance.tree.selection_set.assert_not_called()
+        instance.delete_selected_record.assert_not_called()
+        inserted = instance.input_text.insert.call_args.args[1]
+        jobs, _ignored = app.input_parser.build_input_jobs(inserted)
+        self.assertEqual(len(jobs), 19)
+        self.assertEqual(jobs[13], (14, repeated))
+        self.assertNotIn((20, repeated), jobs)
+
     def test_paste_detects_duplicate_already_in_lower_records(self):
         instance = self._app()
         instance.root = mock.Mock()
