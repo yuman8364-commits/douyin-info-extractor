@@ -42,6 +42,9 @@ class AppWorkflowTests(unittest.TestCase):
         instance.cancel_event = threading.Event()
         instance.silent_thread = None
         instance.silent_refreshing = False
+        instance.running = False
+        instance.refreshing = False
+        instance.records = {}
         return instance
 
     def test_duplicate_paste_is_warned_and_blocked(self):
@@ -91,31 +94,62 @@ class AppWorkflowTests(unittest.TestCase):
         instance.delete_selected_record.assert_called_once_with()
         instance.input_text.delete.assert_not_called()
 
-    def test_manual_removal_of_extracted_link_restores_then_delegates(self):
+    def test_delete_later_duplicate_targets_later_record_only(self):
         instance = self._app()
-        previous = "1. https://www.douyin.com/video/100\n------------\n2."
-        current = "1."
-        instance._input_snapshot = previous
+        repeated = "https://www.douyin.com/video/100"
+        current = (
+            f"1. {repeated}\n------------\n"
+            "2. https://www.douyin.com/video/200\n------------\n"
+            f"3. {repeated}\n------------\n4."
+        )
         instance.input_text = mock.Mock()
+        instance.input_text.index.return_value = "5.8"
         instance.input_text.get.return_value = current
         instance.records = {
             "row-1": {
                 "seq": 1,
-                "raw_input": "https://www.douyin.com/video/100",
-            }
+                "raw_input": repeated,
+            },
+            "row-3": {
+                "seq": 3,
+                "raw_input": repeated,
+            },
         }
         instance.tree = mock.Mock()
         instance.status_var = mock.Mock()
-        instance._enforce_input_sequences = mock.Mock()
-        instance._style_input_sequences = mock.Mock()
-        instance._save_input_cache = mock.Mock()
         instance.delete_selected_record = mock.Mock(return_value="break")
 
-        instance._renumber_input()
+        result = instance.delete_current_input_link()
 
-        instance.input_text.insert.assert_called_once_with("1.0", previous)
-        instance.tree.selection_set.assert_called_once_with("row-1")
+        self.assertEqual(result, "break")
+        instance.tree.selection_set.assert_called_once_with("row-3")
         instance.delete_selected_record.assert_called_once_with()
+
+    def test_paste_detects_duplicate_already_in_lower_records(self):
+        instance = self._app()
+        instance.root = mock.Mock()
+        instance.root.clipboard_get.return_value = "https://www.douyin.com/note/100?foo=1"
+        instance.input_text = mock.Mock()
+        instance.input_text.get.side_effect = lambda start, end: (
+            "1. https://www.douyin.com/video/200\n------------\n2."
+            if (start, end) == ("1.0", "end-1c")
+            else (_ for _ in ()).throw(app.tk.TclError("no selection"))
+        )
+        instance.records = {
+            "row-1": {
+                "seq": 7,
+                "raw_input": "https://www.douyin.com/video/100",
+            }
+        }
+        instance.status_var = mock.Mock()
+        instance._schedule_renumber = mock.Mock()
+
+        with mock.patch.object(app.messagebox, "showwarning") as warning:
+            result = instance._on_input_paste()
+
+        self.assertEqual(result, "break")
+        self.assertIn("第 7 条", warning.call_args.args[1])
+        instance._schedule_renumber.assert_not_called()
 
     def test_user_write_force_closes_excel_wps_and_retries(self):
         locked = exporter.WorkbookInUseError("locked")

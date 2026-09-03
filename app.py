@@ -27,7 +27,7 @@ from tasking import TaskCancelled, TaskMessage, ensure_not_cancelled, interrupti
 from openpyxl import load_workbook
 from PIL import Image, ImageTk
 
-APP_VERSION = "2.0.20"
+APP_VERSION = "2.0.21"
 PREVIEW_BOX_SIZE = (190, 250)
 PREVIEW_IMAGE_SIZE = (170, 230)
 PREVIEW_BACKGROUND = (242, 242, 242, 255)
@@ -435,7 +435,6 @@ class DouyinExtractorApp:
         self.input_text.mark_set("insert", "end-1c")
         self.input_text.see("insert")
         self.load_existing_records()
-        self._input_snapshot = self.input_text.get("1.0", "end-1c")
 
     def _post(self, kind: str, payload=None, extra=None) -> None:
         self.message_queue.put(TaskMessage(kind, payload, extra))
@@ -563,7 +562,9 @@ class DouyinExtractorApp:
         self.input_text.insert("1.0", "1. ")
         self.input_text.bind("<KeyRelease>", self._schedule_renumber)
         self.input_text.bind("<<Paste>>", self._on_input_paste)
-        self.input_text.bind("<<Cut>>", self._schedule_renumber)
+        self.input_text.bind("<<Cut>>", self._on_input_cut)
+        self.input_text.bind("<KeyPress-BackSpace>", self._on_input_delete_key)
+        self.input_text.bind("<KeyPress-Delete>", self._on_input_delete_key)
         self.input_text.bind("<Control-Delete>", self.delete_current_input_link)
 
         output_frame = ttk.Frame(main)
@@ -902,7 +903,6 @@ class DouyinExtractorApp:
         self.input_text.see("insert")
         self._style_input_sequences()
         self._save_input_cache()
-        self._input_snapshot = formatted
         self.status_var.set(
             f"已从“{path.name}”按文档顺序导入 {len(links)} 条链接（未联网、未修改原文档）"
         )
@@ -1642,7 +1642,6 @@ class DouyinExtractorApp:
         self.input_text.see("insert")
         self._style_input_sequences()
         self._save_input_cache()
-        self._input_snapshot = new_input.rstrip("\n")
         self.thumb_ref = None
         self.preview.config(image="", text="选中一行查看封面预览")
         self.load_existing_records()
@@ -2011,7 +2010,7 @@ class DouyinExtractorApp:
         self._renumber_after_id = self.root.after_idle(self._renumber_input)
 
     def _on_input_paste(self, _event=None):
-        """粘贴前检查已存在的链接；重复时提示并阻止本次粘贴。"""
+        """粘贴发生前立即检查上方输入和下方已提取记录。"""
         try:
             pasted = self.root.clipboard_get()
         except tk.TclError:
@@ -2027,6 +2026,19 @@ class DouyinExtractorApp:
             pass
 
         duplicates = input_parser.existing_duplicate_urls(current, str(pasted))
+        known = {input_parser.link_identity(url) for url in extractor.extract_urls(current)}
+        lower_duplicates: list[tuple[str, int]] = []
+        for url in extractor.extract_urls(str(pasted)):
+            identity = input_parser.link_identity(url)
+            if identity in known:
+                continue
+            for record in getattr(self, "records", {}).values():
+                record_urls = extractor.extract_urls(str(record.get("raw_input") or ""))
+                if any(input_parser.link_identity(value) == identity for value in record_urls):
+                    lower_duplicates.append((url, int(record.get("seq") or 0)))
+                    known.add(identity)
+                    break
+        duplicates.extend(lower_duplicates)
         if duplicates:
             details = "\n".join(
                 f"· 第 {seq} 条：{url}" for url, seq in duplicates[:5]
@@ -2043,6 +2055,132 @@ class DouyinExtractorApp:
             )
             return "break"
 
+        affected = self._selected_input_jobs()
+        if any(self._matching_record_for_input_job(seq, raw) for seq, raw in affected):
+            self.status_var.set("选区包含已提取链接，请先删除该链接再粘贴")
+            messagebox.showwarning(
+                "不能直接替换已提取链接",
+                "当前选区包含已提取链接。\n\n"
+                "请先使用“删除当前链接”同步删除对应记录，再粘贴新链接。",
+                parent=self.root,
+            )
+            return "break"
+
+        self._schedule_renumber()
+        return None
+
+    def _matching_record_for_input_job(self, seq: int, raw: str):
+        """按输入出现位置定位记录；重复链接绝不回退到前面的第一条。"""
+        identities = {
+            input_parser.link_identity(url) for url in extractor.extract_urls(raw)
+        }
+        if not identities:
+            return None
+        exact = []
+        candidates = []
+        for item_id, record in self.records.items():
+            record_ids = {
+                input_parser.link_identity(url)
+                for url in extractor.extract_urls(str(record.get("raw_input") or ""))
+            }
+            if not identities.intersection(record_ids):
+                continue
+            candidates.append((item_id, record))
+            try:
+                record_seq = int(record.get("seq"))
+            except (TypeError, ValueError):
+                record_seq = 0
+            if record_seq == seq:
+                exact.append((item_id, record))
+        if len(exact) == 1:
+            return exact[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _selected_input_jobs(self) -> list[tuple[int, str]]:
+        """返回当前选区实际覆盖到 URL 的输入条目。"""
+        try:
+            start = self.input_text.index("sel.first")
+            end = self.input_text.index("sel.last")
+        except tk.TclError:
+            return []
+        start_line, start_col = (int(value) for value in start.split(".", 1))
+        end_line, end_col = (int(value) for value in end.split(".", 1))
+        current = self.input_text.get("1.0", "end-1c")
+        found: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        for line_number in range(start_line, end_line + 1):
+            line = self.input_text.get(f"{line_number}.0", f"{line_number}.end")
+            selection_start = start_col if line_number == start_line else 0
+            selection_end = end_col if line_number == end_line else len(line)
+            if not any(
+                match.start() < selection_end and match.end() > selection_start
+                for match in extractor.DOUYIN_URL_RE.finditer(line)
+            ):
+                continue
+            job = input_parser.input_job_at_line(current, line_number)
+            if job and job[0] not in seen:
+                found.append(job)
+                seen.add(job[0])
+        return found
+
+    def _input_jobs_affected_by_delete_key(self, event) -> list[tuple[int, str]]:
+        selected = self._selected_input_jobs()
+        if selected:
+            return selected
+        try:
+            index = self.input_text.index("insert")
+            line_number, column = (int(value) for value in index.split(".", 1))
+            line = self.input_text.get(f"{line_number}.0", f"{line_number}.end")
+        except (TypeError, ValueError, tk.TclError):
+            return []
+        character = column - 1 if getattr(event, "keysym", "") == "BackSpace" else column
+        if character < 0 or not any(
+            match.start() <= character < match.end()
+            for match in extractor.DOUYIN_URL_RE.finditer(line)
+        ):
+            return []
+        current = self.input_text.get("1.0", "end-1c")
+        job = input_parser.input_job_at_line(current, line_number)
+        return [job] if job else []
+
+    def _route_input_jobs_to_record_deletion(self, jobs: list[tuple[int, str]]) -> bool:
+        """在文本被改坏前，将单个已提取条目送入完整删除事务。"""
+        matches = []
+        for seq, raw in jobs:
+            match = self._matching_record_for_input_job(seq, raw)
+            if match and match not in matches:
+                matches.append(match)
+        if not matches:
+            return False
+        if len(matches) != 1:
+            self.status_var.set("一次只能同步删除一条已提取链接")
+            messagebox.showwarning(
+                "请逐条删除",
+                "选区包含多条已提取链接。为避免误删，请每次只删除一条。",
+                parent=self.root,
+            )
+            return True
+        item_id, record = matches[0]
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        self.tree.see(item_id)
+        self.status_var.set(f"请确认同步删除第 {record.get('seq')} 条已提取链接")
+        self.delete_selected_record()
+        return True
+
+    def _on_input_delete_key(self, event):
+        if self.running or self.refreshing:
+            return None
+        jobs = self._input_jobs_affected_by_delete_key(event)
+        return "break" if self._route_input_jobs_to_record_deletion(jobs) else None
+
+    def _on_input_cut(self, _event=None):
+        if self.running or self.refreshing:
+            return None
+        if self._route_input_jobs_to_record_deletion(self._selected_input_jobs()):
+            return "break"
         self._schedule_renumber()
         return None
 
@@ -2053,62 +2191,13 @@ class DouyinExtractorApp:
         - 只规范/恢复序号前缀，后面的原始链接与分享文案原样保留；
         - 多行粘贴仍视为一条内容，不逐行重排。
         """
-        previous = getattr(self, "_input_snapshot", None)
         self._enforce_input_sequences()
-        current = self.input_text.get("1.0", "end-1c")
-        if previous is None:
-            self._input_snapshot = current
-            return
-
-        removed = set(input_parser.removed_urls(previous, current))
-        matches = []
-        if removed:
-            for item_id, record in self.records.items():
-                record_urls = set(
-                    extractor.extract_urls(str(record.get("raw_input") or ""))
-                )
-                if record_urls.intersection(removed):
-                    matches.append((item_id, record))
-        if not matches:
-            self._input_snapshot = current
-            return
-
-        # 已提取链接不能只从上方擦除：先恢复到修改前，
-        # 再进入已有的完整删除事务。取消或失败时上下仍保持一致。
-        self.input_text.delete("1.0", "end")
-        self.input_text.insert("1.0", previous)
-        self.input_text.mark_set("insert", "end-1c")
-        self.input_text.see("insert")
-        self._style_input_sequences()
-        self._save_input_cache()
-        self._input_snapshot = previous
-        if len(matches) != 1:
-            messagebox.showwarning(
-                "请逐条删除",
-                "一次检测到多条已提取链接被删除。\n\n"
-                "为避免 Excel 和关联文件只删除一部分，已恢复上方输入。"
-                "请每次只删除一条。",
-                parent=self.root,
-            )
-            self.status_var.set("一次只能同步删除一条已提取链接，上方输入已恢复")
-            return
-
-        item_id, record = matches[0]
-        self.tree.selection_set(item_id)
-        self.tree.focus(item_id)
-        self.tree.see(item_id)
-        self.status_var.set(
-            f"检测到第 {record.get('seq')} 条已提取链接被删，请确认同步删除"
-        )
-        self.delete_selected_record()
-        self._input_snapshot = self.input_text.get("1.0", "end-1c")
 
     def clear_input(self) -> None:
         self.input_text.delete("1.0", "end")
         self.input_text.insert("1.0", "1.")
         self._style_input_sequences()
         self._save_input_cache()
-        self._input_snapshot = "1."
         self.status_var.set("输入已清空")
 
     def delete_current_input_link(self, _event=None) -> str:
@@ -2128,13 +2217,9 @@ class DouyinExtractorApp:
             self.status_var.set("请先把光标放在要删除的链接内容上")
             return "break"
 
-        removed_urls = set(extractor.extract_urls(removed_raw))
-        for item_id, record in self.records.items():
-            record_urls = set(
-                extractor.extract_urls(str(record.get("raw_input") or ""))
-            )
-            if not record_urls.intersection(removed_urls):
-                continue
+        match = self._matching_record_for_input_job(removed_seq, removed_raw)
+        if match:
+            item_id, _record = match
             self.tree.selection_set(item_id)
             self.tree.focus(item_id)
             self.tree.see(item_id)
@@ -2146,7 +2231,6 @@ class DouyinExtractorApp:
         self.input_text.see("insert")
         self._style_input_sequences()
         self._save_input_cache()
-        self._input_snapshot = updated
         self.status_var.set(
             f"已删除第 {removed_seq} 条输入链接，后续序号已依次前移"
         )

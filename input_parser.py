@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit
 
 import extractor
 
@@ -200,21 +201,32 @@ def existing_duplicate_urls(text: str, pasted_text: str) -> list[tuple[str, int]
         real_seq += 1
         raw = _block_raw_content(block, real_seq)
         for url in extractor.extract_urls(raw):
-            existing.setdefault(url, real_seq)
+            existing.setdefault(link_identity(url), real_seq)
 
     duplicates: list[tuple[str, int]] = []
     for url in extractor.extract_urls(pasted_text):
-        if url in existing:
-            duplicates.append((url, existing[url]))
+        identity = link_identity(url)
+        if identity in existing:
+            duplicates.append((url, existing[identity]))
     return duplicates
 
 
-def removed_urls(previous_text: str, current_text: str) -> list[str]:
-    """返回从上一版输入中消失的链接，并保留原出现顺序。"""
-    current_urls = set(extractor.extract_urls(current_text))
-    return [
-        url for url in extractor.extract_urls(previous_text) if url not in current_urls
-    ]
+def link_identity(url: str) -> str:
+    """生成用于即时去重的稳定标识，不联网。
+
+    抖音作品长链按作品 ID 比较；短链按主机和路径比较，
+    忽略协议、查询参数、片段和末尾斜杠。
+    """
+    value = str(url or "").strip()
+    try:
+        _kind, aweme_id = extractor.parse_id_kind(value)
+        return f"aweme:{aweme_id}"
+    except extractor.InvalidLinkError:
+        pass
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/") or "/"
+    return f"url:{host}{path}"
 
 
 def remove_entry_at_line(text: str, line_number: int) -> tuple[str, int | None, str]:
@@ -263,10 +275,11 @@ def remove_entry_at_line(text: str, line_number: int) -> tuple[str, int | None, 
 
 
 def remove_matching_entry(text: str, seq: int, raw_input: str) -> tuple[str, int]:
-    """删除与记录链接匹配的输入块并连续重排编号。
+    """删除与记录序号和链接同时匹配的一个输入块。
 
-    有可识别链接时只按链接匹配，避免当前输入框内容与表格顺序不同步时
-    误删同位置的其它任务；旧记录没有链接时才回退到序号位置。
+    重复链接可能同时出现在多个位置，因此不能删除所有链接相同的块。
+    优先删除记录序号指向且链接匹配的那一块；序号已不同步时，
+    只有链接在输入中唯一匹配才允许回退，避免误删前面的重复项。
     """
     raw_entries: list[str] = []
     for index, block in enumerate(split_entry_blocks(text), 1):
@@ -277,24 +290,28 @@ def remove_matching_entry(text: str, seq: int, raw_input: str) -> tuple[str, int
             raw_entries.append(raw)
 
     target_urls = set(extractor.extract_urls(str(raw_input or "")))
-    kept: list[str] = []
-    removed = 0
-    for index, raw in enumerate(raw_entries, 1):
-        urls = set(extractor.extract_urls(raw))
-        matches = bool(target_urls and urls.intersection(target_urls))
-        if not target_urls:
-            matches = index == int(seq)
-        if matches:
-            removed += 1
-        else:
-            kept.append(raw)
+    target_index: int | None = None
+    requested_index = int(seq) - 1
+    if target_urls:
+        candidates = [
+            index
+            for index, raw in enumerate(raw_entries)
+            if set(extractor.extract_urls(raw)).intersection(target_urls)
+        ]
+        if requested_index in candidates:
+            target_index = requested_index
+        elif len(candidates) == 1:
+            target_index = candidates[0]
+    elif 0 <= requested_index < len(raw_entries):
+        target_index = requested_index
 
-    if removed == 0:
+    if target_index is None:
         return normalize_input_text(text), 0
+    kept = [raw for index, raw in enumerate(raw_entries) if index != target_index]
     if not kept:
-        return "1.", removed
+        return "1.", 1
     combined = f"\n{DIVIDER}\n".join(kept)
-    return normalize_input_text(combined), removed
+    return normalize_input_text(combined), 1
 
 
 def build_input_tasks(text: str) -> tuple[list[str], int]:

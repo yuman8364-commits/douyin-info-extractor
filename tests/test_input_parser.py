@@ -97,6 +97,32 @@ class InputParserTests(unittest.TestCase):
             input_parser.build_input_jobs(source)[0],
         )
 
+    def test_delete_later_duplicate_keeps_earlier_duplicate_untouched(self):
+        repeated = "https://www.douyin.com/video/100"
+        source = input_parser.format_ordered_links(
+            [repeated, "https://www.douyin.com/video/200", repeated]
+        )
+
+        updated, removed = input_parser.remove_matching_entry(source, 3, repeated)
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            input_parser.build_input_jobs(updated)[0],
+            [
+                (1, repeated),
+                (2, "https://www.douyin.com/video/200"),
+            ],
+        )
+
+    def test_ambiguous_duplicate_is_not_removed_when_sequence_does_not_match(self):
+        repeated = "https://www.douyin.com/video/100"
+        source = input_parser.format_ordered_links([repeated, repeated])
+
+        updated, removed = input_parser.remove_matching_entry(source, 9, repeated)
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(updated, source)
+
     def test_duplicate_paste_reports_existing_sequence(self):
         source = input_parser.format_ordered_links(
             ["https://www.douyin.com/video/100", "https://v.douyin.com/Abc/"]
@@ -106,23 +132,28 @@ class InputParserTests(unittest.TestCase):
         )
         self.assertEqual(duplicates, [("https://v.douyin.com/Abc/", 2)])
 
-    def test_removed_urls_reports_only_links_missing_from_current_input(self):
-        previous = input_parser.format_ordered_links(
-            [
-                "https://www.douyin.com/video/100",
-                "https://www.douyin.com/video/200",
-                "https://www.douyin.com/video/300",
-            ]
+    def test_duplicate_paste_matches_same_work_across_long_link_variants(self):
+        source = input_parser.format_ordered_links(
+            ["https://www.douyin.com/video/123?previous_page=one"]
         )
-        current = input_parser.format_ordered_links(
-            [
-                "https://www.douyin.com/video/100",
-                "https://www.douyin.com/video/300",
-            ]
+        duplicates = input_parser.existing_duplicate_urls(
+            source, "https://www.douyin.com/note/123?previous_page=two"
         )
         self.assertEqual(
-            input_parser.removed_urls(previous, current),
-            ["https://www.douyin.com/video/200"],
+            duplicates,
+            [("https://www.douyin.com/note/123", 1)],
+        )
+
+    def test_duplicate_paste_normalizes_short_link_query_and_slash(self):
+        source = input_parser.format_ordered_links(
+            ["https://v.douyin.com/AbC123/?share_token=old"]
+        )
+        duplicates = input_parser.existing_duplicate_urls(
+            source, "http://v.douyin.com/AbC123?share_token=new"
+        )
+        self.assertEqual(
+            duplicates,
+            [("http://v.douyin.com/AbC123", 1)],
         )
 
     def test_delete_input_entry_only_shifts_following_sequences(self):
