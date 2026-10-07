@@ -33,6 +33,42 @@ class DeletionResult:
     backup_dir: Path | None
 
 
+def copy_record_artifacts(
+    output_dir: Path, seq: int, destination_name: str = "无真人"
+) -> list[Path]:
+    """按原目录结构复制指定记录的媒体、文案和封面，不修改源文件。"""
+    root = Path(output_dir)
+    number = int(seq)
+    if number <= 0:
+        raise ValueError("记录序号必须大于 0")
+
+    sources: list[Path] = []
+    video = root / "爆款视频" / f"{number}.mp4"
+    note = root / "爆款视频" / str(number)
+    caption = root / "文案提取" / f"{number}.txt"
+    if video.is_file():
+        sources.append(video)
+    if note.is_dir():
+        sources.append(note)
+    if caption.is_file():
+        sources.append(caption)
+    sources.extend(path for path in sorted((root / "封面").glob(f"{number}.*")) if path.is_file())
+    if not sources:
+        raise FileNotFoundError(f"顺序 {number} 没有可复制的视频、图集、文案或封面")
+
+    destination_root = root / destination_name
+    copied: list[Path] = []
+    for source in sources:
+        destination = destination_root / source.relative_to(root)
+        if source.is_dir():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        copied.append(destination)
+    return copied
+
+
 class ArtifactTransaction:
     """单条作品的文件事务。
 

@@ -4,10 +4,47 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from storage import ArtifactTransaction, RecordDeletionTransaction, TransactionError
+from storage import (
+    ArtifactTransaction,
+    RecordDeletionTransaction,
+    TransactionError,
+    copy_record_artifacts,
+)
 
 
 class StorageTransactionTests(unittest.TestCase):
+    def test_copy_record_artifacts_preserves_outer_folder_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for folder in (root / "爆款视频", root / "文案提取", root / "封面"):
+                folder.mkdir(parents=True)
+            (root / "爆款视频" / "4.mp4").write_bytes(b"video")
+            (root / "文案提取" / "4.txt").write_text("caption", encoding="utf-8")
+            (root / "封面" / "4.jpg").write_bytes(b"cover")
+
+            copied = copy_record_artifacts(root, 4)
+
+            self.assertEqual(len(copied), 3)
+            self.assertEqual((root / "无真人" / "爆款视频" / "4.mp4").read_bytes(), b"video")
+            self.assertEqual(
+                (root / "无真人" / "文案提取" / "4.txt").read_text(encoding="utf-8"),
+                "caption",
+            )
+            self.assertEqual((root / "无真人" / "封面" / "4.jpg").read_bytes(), b"cover")
+
+    def test_copy_note_artifacts_keeps_numbered_image_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            note = root / "爆款视频" / "8"
+            note.mkdir(parents=True)
+            (note / "1.jpg").write_bytes(b"image")
+
+            copy_record_artifacts(root, 8)
+
+            self.assertEqual(
+                (root / "无真人" / "爆款视频" / "8" / "1.jpg").read_bytes(),
+                b"image",
+            )
     def _deletion_files(self, root: Path) -> None:
         for folder in (root / "爆款视频", root / "文案提取", root / "封面"):
             folder.mkdir(parents=True, exist_ok=True)

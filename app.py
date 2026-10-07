@@ -5,6 +5,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import ctypes
 import queue
 import random
 import re
@@ -19,15 +20,22 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
+import account_monitor
 import exporter
 import extractor
 import input_parser
-from storage import ArtifactTransaction, RecordDeletionTransaction, TransactionError
+from storage import (
+    ArtifactTransaction,
+    RecordDeletionTransaction,
+    TransactionError,
+    copy_record_artifacts,
+)
 from tasking import TaskCancelled, TaskMessage, ensure_not_cancelled, interruptible_wait
 from openpyxl import load_workbook
 from PIL import Image, ImageTk
+import requests
 
-APP_VERSION = "2.0.22"
+APP_VERSION = "2.1.2"
 PREVIEW_BOX_SIZE = (190, 250)
 PREVIEW_IMAGE_SIZE = (170, 230)
 PREVIEW_BACKGROUND = (242, 242, 242, 255)
@@ -108,6 +116,70 @@ def build_cover_map(output_dir: Path, seqs) -> dict[int, str]:
             if matches:
                 cover_map[seq] = str(matches[0])
     return cover_map
+
+
+def acquire_single_instance():
+    """取得 Windows 单实例互斥量；已有窗口运行时返回 ``None``。"""
+    if os.name != "nt":
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.CreateMutexW(
+        None, False, "Local\\DouyinInfoExtractor_DG11_SingleInstance"
+    )
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def release_single_instance(handle) -> None:
+    if os.name == "nt" and handle not in (None, True):
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.CloseHandle(handle)
+
+
+def build_fetched_record(
+    fetched: extractor.FetchedRecord,
+    raw_input: str,
+    previous: dict | None = None,
+    *,
+    status: str = "正常",
+    **workflow_fields,
+) -> dict:
+    """把抓取结果合并进记录，同时保留既有人工字段和流程字段。"""
+    record = dict(previous or {})
+    record.update(
+        {
+            "raw_input": raw_input,
+            "title": fetched.fields["title"],
+            "tags": fetched.fields["tags"],
+            "likes": fetched.fields["likes"],
+            "comments": fetched.fields["comments"],
+            "author": fetched.fields["author"],
+            "status": status,
+            "aweme_id": fetched.aweme_id,
+            "work_kind": "图文" if fetched.kind == "note" else "视频",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    record.update(workflow_fields)
+    return record
+
+
+def mark_record_status(record: dict | None, status: str) -> dict:
+    """复制旧记录，只更新本次检查状态和时间。"""
+    updated = dict(record or {})
+    updated["status"] = status
+    updated["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return updated
 
 
 def load_config() -> dict:
@@ -406,6 +478,11 @@ class DouyinExtractorApp:
         self.message_queue: queue.Queue[TaskMessage] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.refresh_thread: threading.Thread | None = None
+        self.monitor_thread: threading.Thread | None = None
+        self.monitor_stop_event = threading.Event()
+        self.monitor_queue: queue.Queue[tuple] = queue.Queue()
+        self.monitor_running = False
+        self.monitor_states: dict[str, dict] = {}
         self.cancel_event = threading.Event()
         self.close_requested = False
         self._retry_request = False
@@ -426,6 +503,7 @@ class DouyinExtractorApp:
         self.thumb_ref = None
         self.output_dir = Path(load_config().get("output_dir") or default_output_dir())
         self._build_ui()
+        self._load_monitor_config()
         # 恢复上次关闭前粘贴的链接，光标停在最新编号处，可直接继续粘贴
         cached = load_input_cache()
         if cached.strip() and cached.strip() != "1.":
@@ -435,11 +513,6 @@ class DouyinExtractorApp:
         self.input_text.mark_set("insert", "end-1c")
         self.input_text.see("insert")
         self.load_existing_records()
-        try:
-            self._last_clipboard_text = str(self.root.clipboard_get())
-        except tk.TclError:
-            self._last_clipboard_text = ""
-        self._clipboard_poll_after_id = self.root.after(500, self._poll_clipboard_links)
 
     def _post(self, kind: str, payload=None, extra=None) -> None:
         self.message_queue.put(TaskMessage(kind, payload, extra))
@@ -454,9 +527,10 @@ class DouyinExtractorApp:
 
     def _on_close(self) -> None:
         self._save_input_cache()
+        self.stop_account_monitor(silent=True)
         active = self.running or self.refreshing or any(
             thread is not None and thread.is_alive()
-            for thread in (self.worker, self.refresh_thread)
+            for thread in (self.worker, self.refresh_thread, self.monitor_thread)
         )
         if active:
             if not self.close_requested:
@@ -474,7 +548,7 @@ class DouyinExtractorApp:
         self.root.destroy()
 
     def _wait_then_close(self) -> None:
-        threads = (self.worker, self.refresh_thread)
+        threads = (self.worker, self.refresh_thread, self.monitor_thread)
         if any(thread is not None and thread.is_alive() for thread in threads):
             self.root.after(100, self._wait_then_close)
             return
@@ -537,20 +611,26 @@ class DouyinExtractorApp:
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill="both", expand=True)
 
-        input_header = ttk.Frame(main)
+        input_zone = ttk.Panedwindow(main, orient="horizontal")
+        input_zone.pack(fill="x", pady=(0, 8))
+        input_side = ttk.Frame(input_zone)
+        monitor_side = ttk.LabelFrame(input_zone, text="抖音账号新视频监控", padding=6)
+        input_zone.add(input_side, weight=1)
+        input_zone.add(monitor_side, weight=1)
+
+        input_header = ttk.Frame(input_side)
         input_header.pack(fill="x")
         ttk.Label(
             input_header,
-            text="粘贴抖音链接（序号 1. 2. 3. … 已锁定不可修改，只修改序号后面的原始链接/分享文案；"
-            "粘贴完自动弹出下一个序号）:",
+            text="粘贴作品链接（序号锁定；粘贴后自动续号）:",
         ).pack(side="left", anchor="w")
         self.delete_input_button = ttk.Button(
             input_header, text="删除当前链接", command=self.delete_current_input_link
         )
         self.delete_input_button.pack(side="right")
 
-        input_frame = ttk.Frame(main)
-        input_frame.pack(fill="x", pady=(4, 8))
+        input_frame = ttk.Frame(input_side)
+        input_frame.pack(fill="both", expand=True, pady=(4, 0), padx=(0, 4))
         self.input_text = tk.Text(
             input_frame, height=7, wrap="word", font=("Microsoft YaHei UI", 10)
         )
@@ -571,6 +651,65 @@ class DouyinExtractorApp:
         self.input_text.bind("<KeyPress-BackSpace>", self._on_input_delete_key)
         self.input_text.bind("<KeyPress-Delete>", self._on_input_delete_key)
         self.input_text.bind("<Control-Delete>", self.delete_current_input_link)
+
+        monitor_entry_row = ttk.Frame(monitor_side)
+        monitor_entry_row.pack(fill="x")
+        ttk.Label(monitor_entry_row, text="抖音号/主页:").pack(side="left")
+        self.monitor_account_var = tk.StringVar()
+        self.monitor_account_entry = ttk.Entry(
+            monitor_entry_row, textvariable=self.monitor_account_var
+        )
+        self.monitor_account_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.monitor_add_button = ttk.Button(
+            monitor_entry_row, text="添加", command=self.add_monitor_account
+        )
+        self.monitor_add_button.pack(side="right")
+        self.monitor_import_button = ttk.Button(
+            monitor_entry_row, text="读取表格", command=self.import_monitor_accounts
+        )
+        self.monitor_import_button.pack(side="right", padx=(0, 4))
+        self.monitor_account_entry.bind("<Return>", self.add_monitor_account)
+
+        monitor_controls = ttk.Frame(monitor_side)
+        monitor_controls.pack(fill="x", pady=(5, 4))
+        ttk.Label(monitor_controls, text="每隔").pack(side="left")
+        self.monitor_interval_var = tk.StringVar(value="10")
+        self.monitor_interval_spin = ttk.Spinbox(
+            monitor_controls, from_=1, to=1440, width=5,
+            textvariable=self.monitor_interval_var,
+        )
+        self.monitor_interval_spin.pack(side="left", padx=(3, 2))
+        ttk.Label(monitor_controls, text="分钟检查").pack(side="left")
+        self.monitor_start_button = ttk.Button(
+            monitor_controls, text="开始监控", command=self.start_account_monitor
+        )
+        self.monitor_start_button.pack(side="right")
+        self.monitor_remove_button = ttk.Button(
+            monitor_controls, text="删除", command=self.remove_monitor_account
+        )
+        self.monitor_remove_button.pack(side="right", padx=(0, 4))
+
+        monitor_list_frame = ttk.Frame(monitor_side)
+        monitor_list_frame.pack(fill="both", expand=True)
+        self.monitor_tree = ttk.Treeview(
+            monitor_list_frame,
+            columns=("account", "status", "checked"),
+            show="headings",
+            height=4,
+        )
+        for column, title, width in (
+            ("account", "账号", 130), ("status", "状态", 175), ("checked", "检查时间", 120)
+        ):
+            self.monitor_tree.heading(column, text=title)
+            self.monitor_tree.column(column, width=width, anchor="w")
+        self.monitor_tree.tag_configure("new", background="#d7f2df", foreground="#145c2e")
+        self.monitor_tree.tag_configure("abnormal", background="#fde0e0", foreground="#9b1c1c")
+        self.monitor_tree.pack(side="left", fill="both", expand=True)
+        monitor_scroll = ttk.Scrollbar(
+            monitor_list_frame, orient="vertical", command=self.monitor_tree.yview
+        )
+        self.monitor_tree.configure(yscrollcommand=monitor_scroll.set)
+        monitor_scroll.pack(side="right", fill="y")
 
         output_frame = ttk.Frame(main)
         output_frame.pack(fill="x", pady=(0, 8))
@@ -657,6 +796,10 @@ class DouyinExtractorApp:
         self.tree.bind("<Button-3>", self._show_record_menu)
         self.tree.bind("<Delete>", self.delete_selected_record)
         self.record_menu = tk.Menu(self.tree, tearoff=False)
+        self.record_menu.add_command(
+            label="复制到无真人", command=self.copy_selected_to_no_person
+        )
+        self.record_menu.add_separator()
         self.record_menu.add_command(label="删除选中记录", command=self.delete_selected_record)
 
         self.preview_frame = ttk.Frame(
@@ -681,6 +824,287 @@ class DouyinExtractorApp:
             "（右键下方记录可同步删除链接、表格行和关联文件）"
         )
         ttk.Label(main, textvariable=self.status_var, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def _load_monitor_config(self) -> None:
+        """恢复账号、检查间隔和上次作品基线；默认不自动联网。"""
+        config = load_config()
+        try:
+            interval = max(1, min(1440, int(config.get("monitor_interval_minutes", 10))))
+        except (TypeError, ValueError):
+            interval = 10
+        self.monitor_interval_var.set(str(interval))
+        saved = config.get("monitor_accounts") or []
+        if not isinstance(saved, list):
+            saved = []
+        for entry in saved:
+            if isinstance(entry, str):
+                account_id, state = entry, {}
+            elif isinstance(entry, dict):
+                account_id = str(entry.get("account_id") or "")
+                state = dict(entry)
+            else:
+                continue
+            try:
+                account_id = account_monitor.normalize_account_input(account_id)
+            except ValueError:
+                continue
+            self.monitor_states[account_id] = state
+            self.monitor_tree.insert(
+                "", "end", iid=account_id,
+                values=(account_id, "等待开始", state.get("checked_at") or "—"),
+            )
+
+    def _save_monitor_config(self) -> None:
+        accounts = []
+        for account_id in self.monitor_tree.get_children():
+            state = dict(self.monitor_states.get(account_id) or {})
+            state["account_id"] = account_id
+            accounts.append(state)
+        try:
+            interval = max(1, min(1440, int(self.monitor_interval_var.get())))
+        except (TypeError, ValueError):
+            interval = 10
+        save_config(
+            {"monitor_interval_minutes": interval, "monitor_accounts": accounts}
+        )
+
+    def add_monitor_account(self, _event=None):
+        try:
+            account_id = account_monitor.normalize_account_input(
+                self.monitor_account_var.get()
+            )
+        except ValueError as exc:
+            messagebox.showwarning("无法添加账号", str(exc), parent=self.root)
+            return "break"
+        if account_id in self.monitor_tree.get_children():
+            self.monitor_tree.selection_set(account_id)
+            self.monitor_tree.see(account_id)
+            self.status_var.set(f"账号 {account_id} 已在监控列表中")
+            return "break"
+        self.monitor_states[account_id] = {}
+        self.monitor_tree.insert(
+            "", "end", iid=account_id, values=(account_id, "等待检查", "—")
+        )
+        self.monitor_account_var.set("")
+        self._save_monitor_config()
+        self.status_var.set(f"已添加账号 {account_id}；点击“开始监控”建立首次基线")
+        return "break"
+
+    def import_monitor_accounts(self) -> None:
+        path = filedialog.askopenfilename(
+            title="读取抖音账号表格",
+            filetypes=[
+                ("账号表格", "*.xlsx *.xlsm *.csv *.tsv"),
+                ("Excel 工作簿", "*.xlsx *.xlsm"),
+                ("CSV/TSV", "*.csv *.tsv"),
+                ("所有文件", "*.*"),
+            ],
+            parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            result = account_monitor.import_accounts_from_table(path)
+        except Exception as exc:
+            messagebox.showerror(
+                "读取账号表格失败",
+                f"无法读取表格：\n{exc}\n\n原表格和当前监控列表均未修改。",
+                parent=self.root,
+            )
+            return
+        if not result.matched_columns:
+            messagebox.showwarning(
+                "没有找到账号列",
+                "前 20 行中没有找到账号列。\n\n支持的列名：抖音号、抖音ID、抖音账号、账号、主页链接、抖音主页、sec_uid。",
+                parent=self.root,
+            )
+            return
+        existing = set(self.monitor_tree.get_children())
+        added = 0
+        duplicates = 0
+        for account_id in result.accounts:
+            if account_id in existing:
+                duplicates += 1
+                continue
+            self.monitor_states[account_id] = {}
+            self.monitor_tree.insert(
+                "", "end", iid=account_id, values=(account_id, "等待检查", "—")
+            )
+            existing.add(account_id)
+            added += 1
+        self._save_monitor_config()
+        invalid_note = f"，无效单元格 {len(result.invalid_cells)} 个" if result.invalid_cells else ""
+        self.status_var.set(
+            f"表格读取完成：新增 {added} 个账号，跳过重复 {duplicates} 个{invalid_note}"
+        )
+        messagebox.showinfo(
+            "账号表格读取完成",
+            f"识别账号 {len(result.accounts)} 个\n新增 {added} 个\n已存在 {duplicates} 个"
+            f"\n无效单元格 {len(result.invalid_cells)} 个\n\n点击“开始监控”即可检测全部账号。",
+            parent=self.root,
+        )
+
+    def remove_monitor_account(self) -> None:
+        selected = self.monitor_tree.selection()
+        if not selected:
+            self.status_var.set("请先在右侧选择要删除的监控账号")
+            return
+        for account_id in selected:
+            self.monitor_tree.delete(account_id)
+            self.monitor_states.pop(account_id, None)
+        self._save_monitor_config()
+
+    def start_account_monitor(self) -> None:
+        if self.monitor_running:
+            self.stop_account_monitor()
+            return
+        accounts = list(self.monitor_tree.get_children())
+        if not accounts:
+            self.status_var.set("请先在右侧添加至少一个抖音账号")
+            return
+        try:
+            interval = int(self.monitor_interval_var.get())
+            if not 1 <= interval <= 1440:
+                raise ValueError
+        except (TypeError, ValueError):
+            messagebox.showwarning(
+                "检查间隔无效", "请输入 1–1440 分钟。", parent=self.root
+            )
+            return
+        self.monitor_interval_var.set(str(interval))
+        self._save_monitor_config()
+        self.monitor_stop_event.clear()
+        self.monitor_running = True
+        self.monitor_start_button.config(text="停止监控")
+        self.monitor_interval_spin.config(state="disabled")
+        self.monitor_add_button.config(state="disabled")
+        self.monitor_import_button.config(state="disabled")
+        self.monitor_remove_button.config(state="disabled")
+        self.monitor_thread = threading.Thread(
+            target=self._monitor_loop, args=(accounts, interval * 60), daemon=True
+        )
+        self.monitor_thread.start()
+        self.root.after(100, self._poll_account_monitor)
+        self.status_var.set(f"账号监控已开始，每 {interval} 分钟检查一次")
+
+    def stop_account_monitor(self, *, silent: bool = False) -> None:
+        if not self.monitor_running and self.monitor_thread is None:
+            return
+        self.monitor_stop_event.set()
+        self.monitor_running = False
+        if hasattr(self, "monitor_start_button"):
+            self.monitor_start_button.config(text="开始监控")
+            self.monitor_interval_spin.config(state="normal")
+            self.monitor_add_button.config(state="normal")
+            self.monitor_import_button.config(state="normal")
+            self.monitor_remove_button.config(state="normal")
+        if not silent:
+            self.status_var.set("账号监控已停止")
+
+    def _monitor_loop(self, accounts: list[str], interval_seconds: int) -> None:
+        """后台串行检查账号；网络访问与 Tk 主线程完全分离。"""
+        session = requests.Session()
+        browser_client = None
+        try:
+            while not self.monitor_stop_event.is_set():
+                for account_id in accounts:
+                    if self.monitor_stop_event.is_set():
+                        break
+                    try:
+                        try:
+                            snapshot = account_monitor.check_account(account_id, session)
+                        except account_monitor.MonitorError:
+                            if browser_client is None:
+                                browser_client = account_monitor.BrowserAccountClient(
+                                    BROWSER_PROFILE_DIR
+                                )
+                            snapshot = browser_client.check(account_id)
+                        self.monitor_queue.put(("success", account_id, snapshot))
+                    except account_monitor.AccountAbnormalError as exc:
+                        self.monitor_queue.put(("abnormal", account_id, str(exc)))
+                    except Exception as exc:
+                        self.monitor_queue.put(("error", account_id, str(exc)))
+                if self.monitor_stop_event.wait(interval_seconds):
+                    break
+        finally:
+            if browser_client is not None:
+                browser_client.close()
+            session.close()
+            self.monitor_queue.put(("stopped",))
+
+    def _poll_account_monitor(self) -> None:
+        try:
+            while True:
+                event = self.monitor_queue.get_nowait()
+                kind = event[0]
+                if kind == "success":
+                    self._handle_monitor_success(event[1], event[2])
+                elif kind == "abnormal":
+                    self._handle_monitor_abnormal(event[1], event[2])
+                elif kind == "error":
+                    self._update_monitor_row(event[1], f"检查失败：{event[2]}", "")
+                elif kind == "stopped":
+                    self.monitor_thread = None
+        except queue.Empty:
+            pass
+        if self.monitor_running or self.monitor_thread is not None:
+            self.root.after(250, self._poll_account_monitor)
+
+    def _update_monitor_row(self, account_id: str, status: str, tag: str) -> None:
+        if account_id not in self.monitor_tree.get_children():
+            return
+        checked_at = datetime.now().strftime("%m-%d %H:%M")
+        state = self.monitor_states.setdefault(account_id, {})
+        state["checked_at"] = checked_at
+        display_name = state.get("nickname") or account_id
+        self.monitor_tree.item(
+            account_id,
+            values=(display_name, status, checked_at),
+            tags=(tag,) if tag else (),
+        )
+
+    def _handle_monitor_success(
+        self, account_id: str, snapshot: account_monitor.AccountSnapshot
+    ) -> None:
+        state = self.monitor_states.setdefault(account_id, {})
+        had_baseline = bool(state.get("baseline_initialized"))
+        is_new = account_monitor.is_new_work(state, snapshot)
+        state.update(
+            {
+                "nickname": snapshot.nickname,
+                "latest_aweme_id": snapshot.latest_aweme_id,
+                "latest_create_time": snapshot.latest_create_time,
+                "last_condition": "normal",
+                "baseline_initialized": True,
+            }
+        )
+        if is_new:
+            title = snapshot.latest_desc or f"作品 {snapshot.latest_aweme_id}"
+            self._update_monitor_row(account_id, "发现新视频", "new")
+            self.root.bell()
+            messagebox.showinfo(
+                "抖音账号发布了新视频",
+                f"{snapshot.nickname}（{account_id}）发布了新视频：\n\n{title}",
+                parent=self.root,
+            )
+        else:
+            status = "首次基线已建立" if not had_baseline else "正常，无新视频"
+            if not snapshot.latest_aweme_id:
+                status = "正常，暂无公开作品"
+            self._update_monitor_row(account_id, status, "")
+        self._save_monitor_config()
+
+    def _handle_monitor_abnormal(self, account_id: str, reason: str) -> None:
+        state = self.monitor_states.setdefault(account_id, {})
+        should_alert = state.get("last_condition") != "abnormal"
+        state["last_condition"] = "abnormal"
+        self._update_monitor_row(account_id, f"账号异常：{reason}", "abnormal")
+        self._save_monitor_config()
+        if should_alert:
+            self.root.bell()
+            messagebox.showwarning(
+                "抖音账号异常", f"账号 {account_id} 检查异常：\n\n{reason}", parent=self.root
+            )
 
     def load_existing_records(self) -> None:
         """从输出目录的表格与文件加载已有记录，显示到结果列表（下次打开也能看到）。"""
@@ -1039,6 +1463,133 @@ class DouyinExtractorApp:
         self.worker.start()
         self.root.after(100, self._poll)
 
+    def _access_context(self, verification_kind: str) -> extractor.AccessContext:
+        """创建共享浏览器上下文，并把验证事件转发给当前工作流。"""
+        return extractor.AccessContext(
+            BROWSER_PROFILE_DIR,
+            self.cancel_event,
+            lambda event, message: self._post(
+                verification_kind, {"event": event}, message
+            ),
+        )
+
+    def _download_work_media(
+        self,
+        fetched: extractor.FetchedRecord,
+        seq: int,
+        transaction: ArtifactTransaction,
+        videos_dir: Path,
+        access_context: extractor.AccessContext,
+        logger: logging.Logger,
+    ) -> tuple[Path, str]:
+        """下载一条作品的媒体到事务暂存区，并返回展示名称。"""
+        browser_options = {
+            "browser_context": access_context.browser_context,
+            "browser_context_provider": access_context.ensure_browser_context,
+        }
+        if fetched.kind == "note":
+            staged_media = transaction.note_target()
+
+            def image_progress(done, total, n=seq):
+                self._post(
+                    "progress",
+                    {"seq": n, "done": done, "total": total, "unit": "images"},
+                )
+
+            paths = extractor.download_images(
+                fetched.session,
+                fetched.item,
+                staged_media,
+                image_progress,
+                self.cancel_event,
+                **browser_options,
+            )
+            hits = [
+                find_same_size_file(videos_dir, path.stat().st_size) for path in paths
+            ]
+            if paths and all(hits):
+                logger.warning(
+                    "作品 %s 的图集大小与旧文件相似，仅记录提醒，不自动判重",
+                    fetched.aweme_id,
+                )
+            return staged_media, f"{seq}/（{len(paths)} 张图）"
+
+        staged_media = transaction.video_target()
+
+        def video_progress(done, total, n=seq):
+            self._post(
+                "progress",
+                {"seq": n, "done": done, "total": total, "unit": "bytes"},
+            )
+
+        # 浏览器流在响应头到达前没有字节可回调，先明确显示下载阶段。
+        video_progress(0, 0)
+        extractor.download_video(
+            fetched.session,
+            fetched.item,
+            staged_media,
+            video_progress,
+            cancel_event=self.cancel_event,
+            **browser_options,
+        )
+        size_hit = find_same_size_file(videos_dir, staged_media.stat().st_size)
+        if size_hit:
+            logger.warning(
+                "作品 %s 与 %s 大小相同，仅记录提醒，不自动判重",
+                fetched.aweme_id,
+                size_hit,
+            )
+        return staged_media, f"{seq}.mp4"
+
+    def _download_work_cover(
+        self,
+        fetched: extractor.FetchedRecord,
+        raw_input: str,
+        seq: int,
+        transaction: ArtifactTransaction,
+        access_context: extractor.AccessContext,
+    ) -> Path | None:
+        """下载封面；地址失效时刷新作品数据后重试一次。"""
+        cover_url = fetched.fields.get("cover_url")
+        if not cover_url:
+            return None
+        browser_options = {
+            "browser_context": access_context.browser_context,
+            "browser_context_provider": access_context.ensure_browser_context,
+        }
+
+        def download(session, url):
+            return extractor.download_cover(
+                session,
+                url,
+                transaction.cover_dir(),
+                str(seq),
+                self.cancel_event,
+                **browser_options,
+            )
+
+        try:
+            return download(fetched.session, cover_url)
+        except TaskCancelled:
+            raise
+        except Exception:
+            try:
+                fresh_session, fresh_item = extractor.fetch_item_with_session(
+                    fetched.session,
+                    fetched.aweme_id,
+                    fetched.kind,
+                    self.cancel_event,
+                )
+            except extractor.NetworkRequestError:
+                # Requests 仍不可用时复用当前浏览器上下文刷新作品数据。
+                fresh = access_context.fetch_record(raw_input)
+                fresh_session, fresh_item = fresh.session, fresh.item
+            fresh_fields = extractor.extract_fields(fresh_item, fetched.aweme_id)
+            fresh_url = fresh_fields.get("cover_url")
+            if not fresh_url:
+                raise extractor.ExtractionError("封面地址不可用")
+            return download(fresh_session, fresh_url)
+
     def _work_safe(
         self,
         jobs: list[tuple[int | None, str]],
@@ -1049,13 +1600,7 @@ class DouyinExtractorApp:
         videos_dir = output_dir / "爆款视频"
         xlsx = output_dir / "提取记录.xlsx"
         current_job: tuple[int | None, str] | None = None
-        access_context = extractor.AccessContext(
-            BROWSER_PROFILE_DIR,
-            self.cancel_event,
-            lambda event, message: self._post(
-                "verification", {"event": event}, message
-            ),
-        )
+        access_context = self._access_context("verification")
 
         def has_media(seq: int) -> bool:
             return (videos_dir / f"{seq}.mp4").is_file() or (videos_dir / str(seq)).is_dir()
@@ -1107,10 +1652,8 @@ class DouyinExtractorApp:
                     # 已有记录本次抓取失败时保留标题、互动数和人工字段，但状态
                     # 必须反映本次检查结果，不能继续冒充“正常”。
                     if exact_hit is not None:
-                        failed_record = dict(existing_rows.get(exact_hit) or {})
-                        failed_record["status"] = fail_status
-                        failed_record["updated_at"] = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
+                        failed_record = mark_record_status(
+                            existing_rows.get(exact_hit), fail_status
                         )
                         try:
                             update_records_force_close(
@@ -1151,20 +1694,10 @@ class DouyinExtractorApp:
                 # 恢复旧版分流：只要链接或作品 ID 已在表格中，就永远只刷新
                 # Excel，不以媒体是否存在为条件，也不补下载、不替换媒体。
                 if hit_seq is not None:
-                    updated = dict(existing_rows.get(hit_seq) or {})
-                    updated.update(
-                        {
-                            "raw_input": line,
-                            "title": fetched.fields["title"],
-                            "tags": fetched.fields["tags"],
-                            "likes": fetched.fields["likes"],
-                            "comments": fetched.fields["comments"],
-                            "author": fetched.fields["author"],
-                            "status": "正常",
-                            "aweme_id": fetched.aweme_id,
-                            "work_kind": "图文" if fetched.kind == "note" else "视频",
-                            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
+                    updated = build_fetched_record(
+                        fetched,
+                        line,
+                        existing_rows.get(hit_seq),
                     )
                     try:
                         update_records_force_close(
@@ -1196,9 +1729,7 @@ class DouyinExtractorApp:
                     )
                     continue
 
-                if hit_seq is not None:
-                    seq = hit_seq
-                elif input_seq is not None:
+                if input_seq is not None:
                     seq = input_seq
                 else:
                     seq = (max(used_seqs) + 1) if used_seqs else 1
@@ -1209,125 +1740,23 @@ class DouyinExtractorApp:
                     keep_backup=getattr(self, "backup_enabled", False),
                 )
                 try:
-                    if fetched.kind == "note":
-                        staged_media = transaction.note_target()
-
-                        def image_progress(done, total, n=seq):
-                            self._post(
-                                "progress",
-                                {"seq": n, "done": done, "total": total, "unit": "images"},
-                            )
-
-                        paths = extractor.download_images(
-                            fetched.session,
-                            fetched.item,
-                            staged_media,
-                            image_progress,
-                            self.cancel_event,
-                            browser_context=access_context.browser_context,
-                            browser_context_provider=access_context.ensure_browser_context,
-                        )
-                        hits = [
-                            find_same_size_file(videos_dir, path.stat().st_size)
-                            for path in paths
-                        ]
-                        if paths and all(hits):
-                            logger.warning(
-                                "作品 %s 的图集大小与旧文件相似，仅记录提醒，不自动判重",
-                                fetched.aweme_id,
-                            )
-                        media_display = f"{seq}/（{len(paths)} 张图）"
-                    else:
-                        staged_media = transaction.video_target()
-
-                        def video_progress(done, total, n=seq):
-                            self._post(
-                                "progress",
-                                {"seq": n, "done": done, "total": total, "unit": "bytes"},
-                            )
-
-                        # 浏览器流在响应头到达前没有字节可回调，先明确显示当前
-                        # 已进入媒体下载阶段，避免用户误以为提取或写入线程卡死。
-                        video_progress(0, 0)
-                        extractor.download_video(
-                            fetched.session,
-                            fetched.item,
-                            staged_media,
-                            video_progress,
-                            cancel_event=self.cancel_event,
-                            browser_context=access_context.browser_context,
-                            browser_context_provider=access_context.ensure_browser_context,
-                        )
-                        size_hit = find_same_size_file(
-                            videos_dir, staged_media.stat().st_size
-                        )
-                        if size_hit:
-                            logger.warning(
-                                "作品 %s 与 %s 大小相同，仅记录提醒，不自动判重",
-                                fetched.aweme_id,
-                                size_hit,
-                            )
-                        media_display = f"{seq}.mp4"
-
-                    staged_cover = None
-                    if fetched.fields.get("cover_url"):
-                        try:
-                            staged_cover = extractor.download_cover(
-                                fetched.session,
-                                fetched.fields["cover_url"],
-                                transaction.cover_dir(),
-                                str(seq),
-                                self.cancel_event,
-                                browser_context=access_context.browser_context,
-                                browser_context_provider=access_context.ensure_browser_context,
-                            )
-                        except TaskCancelled:
-                            raise
-                        except Exception:
-                            try:
-                                fresh_session, fresh_item = extractor.fetch_item_with_session(
-                                    fetched.session,
-                                    fetched.aweme_id,
-                                    fetched.kind,
-                                    self.cancel_event,
-                                )
-                            except extractor.NetworkRequestError:
-                                # 封面地址过期且 Requests 链路仍不可用时，
-                                # 复用当前浏览器上下文重新取得作品数据。
-                                fresh = access_context.fetch_record(line)
-                                fresh_session, fresh_item = fresh.session, fresh.item
-                            fresh_fields = extractor.extract_fields(
-                                fresh_item, fetched.aweme_id
-                            )
-                            if not fresh_fields.get("cover_url"):
-                                raise extractor.ExtractionError("封面地址不可用")
-                            staged_cover = extractor.download_cover(
-                                fresh_session,
-                                fresh_fields["cover_url"],
-                                transaction.cover_dir(),
-                                str(seq),
-                                self.cancel_event,
-                                browser_context=access_context.browser_context,
-                                browser_context_provider=access_context.ensure_browser_context,
-                            )
-
-                    old_record = existing_rows.get(seq) or {}
-                    record = {
-                        "raw_input": line,
-                        "title": fetched.fields["title"],
-                        "tags": fetched.fields["tags"],
-                        "likes": fetched.fields["likes"],
-                        "comments": fetched.fields["comments"],
-                        "type": old_record.get("type") or "基本盘",
-                        "author": fetched.fields["author"],
-                        "status": "正常",
-                        "aweme_id": fetched.aweme_id,
-                        "work_kind": "图文" if fetched.kind == "note" else "视频",
-                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "media_display": media_display,
-                        "seq": seq,
-                        "replace": replacing,
-                    }
+                    staged_media, media_display = self._download_work_media(
+                        fetched, seq, transaction, videos_dir, access_context, logger
+                    )
+                    staged_cover = self._download_work_cover(
+                        fetched, line, seq, transaction, access_context
+                    )
+                    record = build_fetched_record(
+                        fetched,
+                        line,
+                        {
+                            "type": (existing_rows.get(seq) or {}).get("type")
+                            or "基本盘"
+                        },
+                        media_display=media_display,
+                        seq=seq,
+                        replace=replacing,
+                    )
 
                     def persist_workbook(final_cover: Path | None) -> None:
                         latest_rows = exporter.read_records(xlsx)
@@ -1552,7 +1981,7 @@ class DouyinExtractorApp:
             self.preview.config(image="", text="封面不可用")
 
     def _show_record_menu(self, event) -> str:
-        """右键选中光标下的记录并显示删除入口。"""
+        """右键选中光标下的记录并显示文件复制/删除入口。"""
         item_id = self.tree.identify_row(event.y)
         if item_id:
             self.tree.selection_set(item_id)
@@ -1567,10 +1996,43 @@ class DouyinExtractorApp:
         self.record_menu.entryconfig(
             "删除选中记录", state="normal" if can_delete else "disabled"
         )
+        self.record_menu.entryconfig(
+            "复制到无真人", state="normal" if can_delete else "disabled"
+        )
         try:
             self.record_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.record_menu.grab_release()
+        return "break"
+
+    def copy_selected_to_no_person(self) -> str:
+        """把选中记录的现有产物按原结构复制进「无真人」文件夹。"""
+        if self.running or self.refreshing:
+            self.status_var.set("正在提取/刷新中，不能复制记录文件")
+            return "break"
+        selection = self.tree.selection()
+        if not selection:
+            self.status_var.set("请先在下方选择一条已提取记录")
+            return "break"
+        record = self.records.get(selection[0]) or {}
+        seq = record.get("seq")
+        if not isinstance(seq, int) or seq <= 0:
+            self.status_var.set("这不是已经写入提取记录的项目，无法复制")
+            return "break"
+
+        output_dir = Path(self.output_var.get().strip() or default_output_dir())
+        try:
+            copied = copy_record_artifacts(output_dir, seq)
+        except FileNotFoundError as exc:
+            self.status_var.set(str(exc))
+            messagebox.showwarning("没有可复制内容", str(exc), parent=self.root)
+            return "break"
+        except OSError as exc:
+            self.status_var.set(f"复制顺序 {seq} 失败：{exc}")
+            messagebox.showerror("复制失败", str(exc), parent=self.root)
+            return "break"
+
+        self.status_var.set(f"已将顺序 {seq} 的 {len(copied)} 项内容复制到“无真人”")
         return "break"
 
     def delete_selected_record(self, _event=None) -> str:
@@ -1811,13 +2273,7 @@ class DouyinExtractorApp:
         unchecked = 0
         terminal_kind = "rdone"
         terminal_payload = None
-        access_context = extractor.AccessContext(
-            BROWSER_PROFILE_DIR,
-            self.cancel_event,
-            lambda event, message: self._post(
-                "rverification", {"event": event}, message
-            ),
-        )
+        access_context = self._access_context("rverification")
         try:
             for index, (seq, rec) in enumerate(targets, 1):
                 ensure_not_cancelled(self.cancel_event)
@@ -1844,21 +2300,13 @@ class DouyinExtractorApp:
                 }
                 # 每检查完一条就立即写回，避免整批结束前 Excel 仍显示旧数据。
                 rows = exporter.read_records(output_dir / "提取记录.xlsx")
-                current = dict(rows.get(seq) or rec)
+                previous = rows.get(seq) or rec
                 if fetched is not None:
-                    current.update(
-                        {
-                            "raw_input": link,
-                            "title": fetched.fields["title"],
-                            "tags": fetched.fields["tags"],
-                            "likes": fetched.fields["likes"],
-                            "comments": fetched.fields["comments"],
-                            "author": fetched.fields["author"],
-                            "status": success_status,
-                            "aweme_id": fetched.aweme_id,
-                            "work_kind": "图文" if fetched.kind == "note" else "视频",
-                            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
+                    current = build_fetched_record(
+                        fetched,
+                        link,
+                        previous,
+                        status=success_status,
                     )
                 else:
                     logger.warning(
@@ -1866,8 +2314,7 @@ class DouyinExtractorApp:
                         seq,
                         fail_status,
                     )
-                    current["status"] = fail_status
-                    current["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    current = mark_record_status(previous, fail_status)
                 rows[seq] = current
                 update_records_force_close(
                     output_dir / "提取记录.xlsx",
@@ -2015,7 +2462,7 @@ class DouyinExtractorApp:
         self._renumber_after_id = self.root.after_idle(self._renumber_input)
 
     def _on_input_paste(self, _event=None):
-        """粘贴发生前立即检查上方输入和下方已提取记录。"""
+        """只丢弃本次粘贴中的重复链接，绝不触发既有记录删除。"""
         try:
             pasted = self.root.clipboard_get()
         except tk.TclError:
@@ -2032,7 +2479,20 @@ class DouyinExtractorApp:
 
         duplicates = self._duplicate_urls_against_known(current, str(pasted))
         if duplicates:
-            self._show_duplicate_link_warning(duplicates, "本次未粘贴")
+            filtered = self._remove_duplicate_urls_from_paste(str(pasted), duplicates)
+            if extractor.extract_urls(filtered):
+                # 默认粘贴必须被拦截，否则重复内容仍会进入输入区；这里只
+                # 按普通粘贴语义替换当前选区并插入过滤后的非重复内容。
+                try:
+                    self.input_text.delete("sel.first", "sel.last")
+                except tk.TclError:
+                    pass
+                self.input_text.insert("insert", filtered)
+                self._schedule_renumber()
+                action = "已删除本次重复链接，其余新链接已保留"
+            else:
+                action = "已删除本次重复链接"
+            self._show_duplicate_link_warning(duplicates, action)
             return "break"
 
         affected = self._selected_input_jobs()
@@ -2049,60 +2509,70 @@ class DouyinExtractorApp:
         self._schedule_renumber()
         return None
 
+    @staticmethod
+    def _remove_duplicate_urls_from_paste(
+        candidate: str, duplicates: list[tuple[str, int, str]]
+    ) -> str:
+        """从本次粘贴文本移除重复 URL；只含该 URL 的分享行整行丢弃。"""
+        duplicate_urls = {new_url for new_url, _seq, _old_url in duplicates}
+        kept_lines: list[str] = []
+        for line in candidate.splitlines():
+            hits = [url for url in extractor.extract_urls(line) if url in duplicate_urls]
+            if not hits:
+                kept_lines.append(line)
+                continue
+            cleaned = line
+            for url in hits:
+                cleaned = cleaned.replace(url, "")
+            # 分享文案与唯一一个重复 URL 在同一行时，整行属于这次重复项；
+            # 若同一行仍有其它新 URL，则只去掉重复 URL 并保留其余内容。
+            if extractor.extract_urls(cleaned):
+                kept_lines.append(cleaned.strip())
+        return "\n".join(kept_lines).strip()
+
     def _duplicate_urls_against_known(
         self, current: str, candidate: str
-    ) -> list[tuple[str, int]]:
-        """同时检查输入区和提取记录中的重复链接。"""
-        duplicates = input_parser.existing_duplicate_urls(current, candidate)
-        known = {input_parser.link_identity(url) for url in extractor.extract_urls(current)}
-        lower_duplicates: list[tuple[str, int]] = []
+    ) -> list[tuple[str, int, str]]:
+        """按出现顺序比较候选链接，并返回新旧双方链接及前序号。"""
+        known = self._known_link_details(current)
+        next_seq = max((seq for seq, _url in known.values()), default=0) + 1
+        duplicates: list[tuple[str, int, str]] = []
         for url in extractor.extract_urls(candidate):
             identity = input_parser.link_identity(url)
-            if identity in known:
+            previous = known.get(identity)
+            if previous is not None:
+                duplicates.append((url, previous[0], previous[1]))
                 continue
-            for record in getattr(self, "records", {}).values():
-                record_urls = extractor.extract_urls(str(record.get("raw_input") or ""))
-                if any(input_parser.link_identity(value) == identity for value in record_urls):
-                    lower_duplicates.append((url, int(record.get("seq") or 0)))
-                    known.add(identity)
-                    break
-        duplicates.extend(lower_duplicates)
+            known[identity] = (next_seq, url)
+            next_seq += 1
         return duplicates
 
+    def _known_link_details(self, current: str) -> dict[str, tuple[int, str]]:
+        """生成上方输入区的“链接身份 →（前序号，原链接）”快照。"""
+        known: dict[str, tuple[int, str]] = {}
+        jobs, _ignored = input_parser.build_input_jobs(current)
+        for seq, raw in jobs:
+            if seq is None:
+                continue
+            for url in extractor.extract_urls(raw):
+                known.setdefault(input_parser.link_identity(url), (int(seq), url))
+        return known
+
     def _show_duplicate_link_warning(
-        self, duplicates: list[tuple[str, int]], action: str
+        self, duplicates: list[tuple[str, int, str]], action: str
     ) -> None:
-        details = "\n".join(f"· 第 {seq} 条：{url}" for url, seq in duplicates[:5])
+        details = "\n\n".join(
+            f"· 新链接：{new_url}\n  与前面第 {seq} 条重复：{old_url}"
+            for new_url, seq, old_url in duplicates[:5]
+        )
         if len(duplicates) > 5:
             details += f"\n· 其他 {len(duplicates) - 5} 条重复链接"
         self.status_var.set(f"链接重复：已在第 {duplicates[0][1]} 条，{action}")
         messagebox.showwarning(
             "链接重复",
-            f"检测到链接已经存在：\n\n{details}",
+            f"检测到链接已经存在：\n\n{details}\n\n{action}；原链接及其它数据未修改。",
             parent=self.root,
         )
-
-    def _poll_clipboard_links(self) -> None:
-        """应用运行时检测新复制的抖音链接，并立即提示重复。"""
-        try:
-            clipboard_text = str(self.root.clipboard_get())
-        except tk.TclError:
-            clipboard_text = ""
-        if clipboard_text != getattr(self, "_last_clipboard_text", ""):
-            self._last_clipboard_text = clipboard_text
-            if extractor.extract_urls(clipboard_text):
-                current = self.input_text.get("1.0", "end-1c")
-                duplicates = self._duplicate_urls_against_known(
-                    current, clipboard_text
-                )
-                if duplicates:
-                    self._show_duplicate_link_warning(
-                        duplicates, "刚复制的链接未加入列表"
-                    )
-        if not self.close_requested:
-            self._clipboard_poll_after_id = self.root.after(
-                500, self._poll_clipboard_links
-            )
 
     def _matching_record_for_input_job(self, seq: int, raw: str):
         """只按“相同序号 + 相同链接”定位已提取记录。
@@ -2298,6 +2768,10 @@ def report_unhandled_error(
 
 def main() -> None:
     root: tk.Tk | None = None
+    instance_handle = acquire_single_instance()
+    if instance_handle is None:
+        # 已有窗口正在监听剪贴板时直接退出，避免多个后台实例重复弹窗。
+        return
     try:
         root = tk.Tk()
         root.report_callback_exception = lambda exc_type, exc_value, exc_traceback: (
@@ -2309,6 +2783,8 @@ def main() -> None:
         exc_type, exc_value, exc_traceback = sys.exc_info()
         if exc_type is not None and exc_value is not None:
             report_unhandled_error(exc_type, exc_value, exc_traceback, root)
+    finally:
+        release_single_instance(instance_handle)
 
 
 if __name__ == "__main__":

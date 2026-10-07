@@ -14,6 +14,34 @@ import exporter
 import extractor
 
 
+class SingleInstanceTests(unittest.TestCase):
+    def test_existing_windows_instance_is_detected_and_handle_is_closed(self):
+        kernel32 = mock.Mock()
+        kernel32.CreateMutexW.return_value = 1234
+        with (
+            mock.patch.object(app.os, "name", "nt"),
+            mock.patch.object(app.ctypes, "WinDLL", return_value=kernel32),
+            mock.patch.object(app.ctypes, "get_last_error", return_value=183),
+        ):
+            handle = app.acquire_single_instance()
+
+        self.assertIsNone(handle)
+        kernel32.CloseHandle.assert_called_once_with(1234)
+
+    def test_first_windows_instance_keeps_mutex_handle(self):
+        kernel32 = mock.Mock()
+        kernel32.CreateMutexW.return_value = 5678
+        with (
+            mock.patch.object(app.os, "name", "nt"),
+            mock.patch.object(app.ctypes, "WinDLL", return_value=kernel32),
+            mock.patch.object(app.ctypes, "get_last_error", return_value=0),
+        ):
+            handle = app.acquire_single_instance()
+
+        self.assertEqual(handle, 5678)
+        kernel32.CloseHandle.assert_not_called()
+
+
 def fetched(aweme_id: str, title: str, kind: str = "video") -> extractor.FetchedRecord:
     fields = {
         "aweme_id": aweme_id,
@@ -48,6 +76,68 @@ class AppWorkflowTests(unittest.TestCase):
         instance.records = {}
         return instance
 
+    def test_fetched_record_builder_preserves_manual_fields(self):
+        previous = {"type": "人工分类", "manual_note": "保留", "status": "旧状态"}
+
+        record = app.build_fetched_record(
+            fetched("100", "新标题", kind="note"),
+            "原始分享链接",
+            previous,
+            status="已恢复",
+            seq=3,
+        )
+
+        self.assertEqual(record["type"], "人工分类")
+        self.assertEqual(record["manual_note"], "保留")
+        self.assertEqual(record["title"], "新标题")
+        self.assertEqual(record["work_kind"], "图文")
+        self.assertEqual(record["status"], "已恢复")
+        self.assertEqual(record["seq"], 3)
+
+    def test_status_builder_only_changes_status_and_time(self):
+        previous = {"title": "旧标题", "status": "正常", "manual_note": "保留"}
+
+        record = app.mark_record_status(previous, "网络异常")
+
+        self.assertEqual(record["title"], "旧标题")
+        self.assertEqual(record["manual_note"], "保留")
+        self.assertEqual(record["status"], "网络异常")
+        self.assertRegex(record["updated_at"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertEqual(previous["status"], "正常")
+
+    def test_copy_selected_to_no_person_only_copies_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "爆款视频" / "4.mp4"
+            caption = root / "文案提取" / "4.txt"
+            video.parent.mkdir(parents=True)
+            caption.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            caption.write_text("caption", encoding="utf-8")
+            instance = self._app()
+            instance.tree = mock.Mock()
+            instance.tree.selection.return_value = ("row-4",)
+            original_record = {"seq": 4, "title": "标题", "status": "正常"}
+            instance.records = {"row-4": original_record.copy()}
+            instance.output_var = mock.Mock()
+            instance.output_var.get.return_value = str(root)
+            instance.status_var = mock.Mock()
+
+            result = instance.copy_selected_to_no_person()
+
+            self.assertEqual(result, "break")
+            self.assertEqual(instance.records["row-4"], original_record)
+            self.assertEqual(
+                (root / "无真人" / "爆款视频" / "4.mp4").read_bytes(),
+                b"video",
+            )
+            self.assertEqual(
+                (root / "无真人" / "文案提取" / "4.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "caption",
+            )
+
     def test_duplicate_paste_is_warned_and_blocked(self):
         instance = self._app()
         instance.root = mock.Mock()
@@ -67,7 +157,72 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual(result, "break")
         warning.assert_called_once()
         self.assertIn("链接重复", warning.call_args.args[0])
+        self.assertIn("新链接：https://v.douyin.com/Same/", warning.call_args.args[1])
+        self.assertIn("与前面第 1 条重复", warning.call_args.args[1])
+        self.assertIn("https://v.douyin.com/Same/", warning.call_args.args[1])
+        instance.root.clipboard_get.assert_called_once_with()
         instance._schedule_renumber.assert_not_called()
+        instance.input_text.delete.assert_not_called()
+        instance.input_text.insert.assert_not_called()
+
+    def test_mixed_paste_removes_only_duplicate_and_keeps_new_link(self):
+        instance = self._app()
+        duplicate = "https://www.douyin.com/video/100"
+        new_link = "https://www.douyin.com/video/200"
+        instance.root = mock.Mock()
+        instance.root.clipboard_get.return_value = f"{duplicate}\n{new_link}"
+        instance.input_text = mock.Mock()
+        instance.input_text.get.side_effect = lambda start, end: (
+            f"1. {duplicate}\n------------\n2."
+            if (start, end) == ("1.0", "end-1c")
+            else (_ for _ in ()).throw(app.tk.TclError("no selection"))
+        )
+        instance.input_text.delete.side_effect = app.tk.TclError("no selection")
+        instance.status_var = mock.Mock()
+        instance._schedule_renumber = mock.Mock()
+        instance.records = {"row-1": {"seq": 1, "raw_input": duplicate}}
+
+        with (
+            mock.patch.object(app.messagebox, "showwarning") as warning,
+            mock.patch.object(instance, "delete_selected_record") as delete_record,
+        ):
+            result = instance._on_input_paste()
+
+        self.assertEqual(result, "break")
+        instance.input_text.insert.assert_called_once_with("insert", new_link)
+        instance._schedule_renumber.assert_called_once()
+        delete_record.assert_not_called()
+        self.assertEqual(instance.records["row-1"]["raw_input"], duplicate)
+        self.assertIn("原链接及其它数据未修改", warning.call_args.args[1])
+
+    def test_later_duplicate_in_same_paste_is_blocked_against_earlier_new_link(self):
+        instance = self._app()
+        first = "https://www.douyin.com/video/8800?from=copy"
+        repeated = "https://www.douyin.com/note/8800?share=1"
+        instance.root = mock.Mock()
+        instance.root.clipboard_get.return_value = f"{first}\n{repeated}"
+        instance.input_text = mock.Mock()
+        instance.input_text.get.side_effect = lambda start, end: (
+            "1. https://www.douyin.com/video/100\n------------\n2."
+            if (start, end) == ("1.0", "end-1c")
+            else (_ for _ in ()).throw(app.tk.TclError("no selection"))
+        )
+        instance.status_var = mock.Mock()
+        instance._schedule_renumber = mock.Mock()
+
+        with mock.patch.object(app.messagebox, "showwarning") as warning:
+            result = instance._on_input_paste()
+
+        self.assertEqual(result, "break")
+        self.assertIn(
+            "新链接：https://www.douyin.com/note/8800", warning.call_args.args[1]
+        )
+        self.assertIn(
+            "与前面第 2 条重复：https://www.douyin.com/video/8800",
+            warning.call_args.args[1],
+        )
+        instance.input_text.insert.assert_called_once_with("insert", first)
+        instance._schedule_renumber.assert_called_once()
 
     def test_delete_current_extracted_link_delegates_to_linked_record_deletion(self):
         instance = self._app()
@@ -159,7 +314,7 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual(jobs[13], (14, repeated))
         self.assertNotIn((20, repeated), jobs)
 
-    def test_paste_detects_duplicate_already_in_lower_records(self):
+    def test_paste_ignores_lower_record_when_input_has_no_matching_link(self):
         instance = self._app()
         instance.root = mock.Mock()
         instance.root.clipboard_get.return_value = "https://www.douyin.com/note/100?foo=1"
@@ -177,31 +332,64 @@ class AppWorkflowTests(unittest.TestCase):
         }
         instance.status_var = mock.Mock()
         instance._schedule_renumber = mock.Mock()
+        instance._selected_input_jobs = mock.Mock(return_value=[])
 
         with mock.patch.object(app.messagebox, "showwarning") as warning:
             result = instance._on_input_paste()
 
-        self.assertEqual(result, "break")
-        self.assertIn("第 7 条", warning.call_args.args[1])
-        instance._schedule_renumber.assert_not_called()
+        self.assertIsNone(result)
+        warning.assert_not_called()
+        instance._schedule_renumber.assert_called_once()
 
-    def test_new_clipboard_link_immediately_warns_when_duplicate(self):
+    def test_three_new_links_are_not_self_reported_as_lower_record_duplicates(self):
         instance = self._app()
-        instance._last_clipboard_text = "old clipboard"
+        links = [f"https://www.douyin.com/video/{value}" for value in (100, 200, 300)]
         instance.root = mock.Mock()
-        instance.root.clipboard_get.return_value = "https://www.douyin.com/video/100"
+        instance.root.clipboard_get.return_value = "\n".join(links)
         instance.input_text = mock.Mock()
-        instance.input_text.get.return_value = (
-            "1. https://www.douyin.com/video/100\n------------\n2."
+        instance.input_text.get.side_effect = lambda start, end: (
+            "1."
+            if (start, end) == ("1.0", "end-1c")
+            else (_ for _ in ()).throw(app.tk.TclError("no selection"))
         )
+        instance.records = {
+            f"row-{seq}": {"seq": seq, "raw_input": link}
+            for seq, link in enumerate(links, 1)
+        }
         instance.status_var = mock.Mock()
+        instance._schedule_renumber = mock.Mock()
+        instance._selected_input_jobs = mock.Mock(return_value=[])
 
         with mock.patch.object(app.messagebox, "showwarning") as warning:
-            instance._poll_clipboard_links()
+            result = instance._on_input_paste()
 
-        warning.assert_called_once()
-        self.assertIn("第 1 条", warning.call_args.args[1])
-        instance.root.after.assert_called_once_with(500, instance._poll_clipboard_links)
+        self.assertIsNone(result)
+        warning.assert_not_called()
+        instance._schedule_renumber.assert_called_once()
+
+    def test_allowed_paste_is_checked_only_during_explicit_paste_event(self):
+        instance = self._app()
+        new_link = "https://v.douyin.com/NewLink123/"
+        before = "1. https://www.douyin.com/video/100\n------------\n2."
+        instance.root = mock.Mock()
+        instance.root.clipboard_get.return_value = new_link
+        instance.input_text = mock.Mock()
+        instance.input_text.index.side_effect = app.tk.TclError("no selection")
+        instance.input_text.get.side_effect = lambda start, end: (
+            before
+            if (start, end) == ("1.0", "end-1c")
+            else (_ for _ in ()).throw(app.tk.TclError("no selection"))
+        )
+        instance.status_var = mock.Mock()
+        instance._schedule_renumber = mock.Mock()
+
+        with mock.patch.object(app.messagebox, "showwarning") as warning:
+            result = instance._on_input_paste()
+
+        self.assertIsNone(result)
+        warning.assert_not_called()
+        instance.root.clipboard_get.assert_called_once_with()
+        self.assertFalse(hasattr(app.DouyinExtractorApp, "_poll_clipboard_links"))
 
     def test_user_write_force_closes_excel_wps_and_retries(self):
         locked = exporter.WorkbookInUseError("locked")
